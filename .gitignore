@@ -1,0 +1,29 @@
+# Object and binary files
+*.o
+*.out
+*.bin
+
+# Simulation and waveform outputs
+*.vcd
+*.log
+
+# Build directories
+build/
+
+# Python cache
+__pycache__/
+
+# LaTeX / Paper build artifacts
+*.aux
+*.pdf
+
+# Editor/IDE specific (optional, depending on your environment)
+.vscode/
+*.swp
+.DS_Store
+
+# Ignore hidden placeholder files except .gitkeep
+!.gitkeep
+
+# Ignore docs/
+docs/
