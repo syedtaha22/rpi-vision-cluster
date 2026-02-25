@@ -4,7 +4,7 @@ A distributed image processing system built on a Raspberry Pi cluster.
 
 ## Milestones
 
-- [ ] M0: Virtual cluster & toolchain setup
+- [x] M0: Virtual cluster & toolchain setup
 - [ ] M1: Multi-threaded single-node processing
 - [ ] M2: Shared memory IPC & PRAM analysis
 - [ ] M3: Physical cluster assembly & MPI
