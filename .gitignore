@@ -9,6 +9,7 @@
 
 # Build directories
 build/
+benchmark_results/
 
 # Python cache
 __pycache__/
@@ -27,3 +28,6 @@ __pycache__/
 
 # Ignore docs/
 docs/
+
+# Ignore archives/
+archives/
