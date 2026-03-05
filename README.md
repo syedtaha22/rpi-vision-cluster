@@ -257,30 +257,30 @@ make run FILE=matmul NODES=2
 ```
 Matrix Size:       800x800
 Processes:         2
-Total Time:        42.9974 seconds
-Computation Time:  42.0376 seconds
-Communication Time: 0.2473 seconds
-Compute/Total:     97.77%
-Comm/Total:        0.58%
-Performance:       0.02 GFLOPS
+Total Time:        21.6649 seconds
+Computation Time:  21.5692 seconds
+Communication Time: 0.0942 seconds
+Compute/Total:     99.56%
+Comm/Total:        0.43%
+Performance:       0.05 GFLOPS
 ```
 
 5 Nodes (1 master + 4 workers):
 ```
 Matrix Size:       800x800
 Processes:         5
-Total Time:        17.4313 seconds
-Computation Time:  12.1845 seconds
-Communication Time: 4.4696 seconds
-Compute/Total:     69.90%
-Comm/Total:        25.64%
-Performance:       0.08 GFLOPS
+Total Time:        7.5548 seconds
+Computation Time:  6.9004 seconds
+Communication Time: 0.6535 seconds
+Compute/Total:     91.34%
+Comm/Total:        8.65%
+Performance:       0.15 GFLOPS
 ```
 
 **Analysis:**
-- Speedup: 2.47x when going from 2 to 5 nodes
-- Communication overhead increases significantly: 0.58% to 25.64%
-- Computation time per node varies: 12.18s to 16.43s (load imbalance)
+- Speedup: 2.87x when going from 2 to 5 nodes
+- Communication overhead increases: 0.43% to 8.65%
+- Performance scales well due to optimized loop ordering and deterministic initialization
 
 ### 3. mpi_latency_test.c - Communication Benchmark
 
@@ -313,32 +313,32 @@ make run FILE=latency_test NODES=5
 
 2 Nodes:
 ```
-Message Size: 1 B    | Latency: 80.25 μs  | Bandwidth: 0.01 MB/s
-Message Size: 1 KB   | Latency: 103.41 μs | Bandwidth: 9.44 MB/s
-Message Size: 10 KB  | Latency: 94.45 μs  | Bandwidth: 103.39 MB/s
-Message Size: 100 KB | Latency: 521.31 μs | Bandwidth: 187.33 MB/s
-Message Size: 1 MB   | Latency: 1222.50 μs| Bandwidth: 818.00 MB/s
-
-All-to-All (1KB × 2): 525.90 μs per operation
-Broadcast 1 MB: 1674.03 μs per operation
+Ping-Pong       | Size:       1 B | Time:    1301.72 μs
+Ping-Pong       | Size:    1024 B | Time:     114.16 μs
+Ping-Pong       | Size:   10240 B | Time:     140.65 μs
+Ping-Pong       | Size:  102400 B | Time:    1812.50 μs
+Ping-Pong       | Size: 1048576 B | Time:    1258.84 μs
+Broadcast       | Size:    1024 B | Time:     325.77 μs
+Broadcast       | Size: 1048576 B | Time:    1369.34 μs
+All-to-All      | Size:    2048 B | Time:     709.82 μs
 ```
 
 5 Nodes:
 ```
-Message Size: 1 B    | Latency: 48.00 μs  | Bandwidth: 0.02 MB/s
-Message Size: 1 KB   | Latency: 87.90 μs  | Bandwidth: 11.11 MB/s
-Message Size: 10 KB  | Latency: 94.79 μs  | Bandwidth: 103.02 MB/s
-Message Size: 100 KB | Latency: 484.04 μs | Bandwidth: 201.75 MB/s
-Message Size: 1 MB   | Latency: 1555.95 μs| Bandwidth: 642.70 MB/s
-
-All-to-All (1KB × 5): 19252.26 μs per operation
-Broadcast 1 MB: 5898.54 μs per operation
+Ping-Pong       | Size:       1 B | Time:     993.01 μs
+Ping-Pong       | Size:    1024 B | Time:     423.73 μs
+Ping-Pong       | Size:   10240 B | Time:     618.92 μs
+Ping-Pong       | Size:  102400 B | Time:    3710.34 μs
+Ping-Pong       | Size: 1048576 B | Time:    4045.55 μs
+Broadcast       | Size:    1024 B | Time:     958.04 μs
+Broadcast       | Size: 1048576 B | Time:   17537.10 μs
+All-to-All      | Size:    5120 B | Time:    3490.50 μs
 ```
 
 **Observations:**
-- All-to-All latency scales poorly: 525μs (2 nodes) → 19252μs (5 nodes) - 36x increase
-- Broadcast scales better: 1674μs (2 nodes) → 5899μs (5 nodes) - 3.5x increase
-- Peak bandwidth: 642-818 MB/s for 1MB messages
+- All-to-All communication scales poorly: 710μs (2 nodes) → 3491μs (5 nodes) - 4.9x increase
+- Broadcast 1MB scales poorly: 1369μs (2 nodes) → 17537μs (5 nodes) - 12.8x increase
+- Ping-Pong latency for 1MB: 1259μs (2 nodes) → 4046μs (5 nodes) - 3.2x increase
 
 ---
 

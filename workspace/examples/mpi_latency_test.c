@@ -1,175 +1,79 @@
-/*
- * MPI Latency Test
- * Measures inter-node communication overhead and latency
- */
+// Program to check MPI latency and bandwidth for various message sizes and communication patterns.
+// Use conditional compilation to ensure it runs in serial mode if MPI is not available.
+// Also to prevent error squiggles in environment where MPI headers are not present.
 
-#include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
 
-#define WARMUP_ITERATIONS 10
-#define TEST_ITERATIONS 100
-#define MESSAGE_SIZES 5
+#ifdef __has_include
+#if __has_include(<mpi.h>)
+#include <mpi.h>
+#endif
+#endif
+
+#ifdef OMPI_MPI_H
+#define ITERS 100
+
+// Helper to handle all the timing and printing logic
+void run_test(const char* label, int size, int rank, int cluster_size, int is_coll) {
+    char* sbuf = malloc(size), * rbuf = malloc(size);
+    double start, total = 0;
+
+    // Standardize rank 1 for P2P tests
+    int partner = 1 % cluster_size;
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    start = MPI_Wtime();
+
+    for (int i = 0; i < ITERS / 10; i++) {
+        if (is_coll == 1) MPI_Bcast(sbuf, size, MPI_CHAR, 0, MPI_COMM_WORLD);
+        else if (is_coll == 2) MPI_Alltoall(sbuf, size / cluster_size, MPI_CHAR, rbuf, size / cluster_size, MPI_CHAR, MPI_COMM_WORLD);
+        else { // Point-to-Point Ping-Pong
+            if (rank == 0) {
+                MPI_Send(sbuf, size, MPI_CHAR, partner, 0, MPI_COMM_WORLD);
+                MPI_Recv(rbuf, size, MPI_CHAR, partner, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+            else if (rank == partner) {
+                MPI_Recv(rbuf, size, MPI_CHAR, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                MPI_Send(sbuf, size, MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+            }
+        }
+    }
+
+    total = MPI_Wtime() - start;
+    if (rank == 0) {
+        double avg = (total / (ITERS / 10)) * 1e6;
+        printf("%-15s | Size: %7d B | Time: %10.2f us\n", label, size, avg);
+    }
+    free(sbuf); free(rbuf);
+}
 
 int main(int argc, char** argv) {
     int rank, size;
-    double start_time, end_time;
-    double latency, bandwidth;
-    
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
-    
-    if (rank == 0) {
-        printf("=== MPI Communication Latency Test ===\n");
-        printf("Cluster Size: %d nodes\n", size);
-        printf("Test Iterations: %d\n\n", TEST_ITERATIONS);
-    }
-    
-    // Test different message sizes
-    int msg_sizes[MESSAGE_SIZES] = {1, 1024, 10240, 102400, 1048576}; // 1B, 1KB, 10KB, 100KB, 1MB
-    
-    for (int test = 0; test < MESSAGE_SIZES; test++) {
-        int msg_size = msg_sizes[test];
-        char* send_buffer = (char*)malloc(msg_size);
-        char* recv_buffer = (char*)malloc(msg_size);
-        
-        // Initialize buffer
-        for (int i = 0; i < msg_size; i++) {
-            send_buffer[i] = (char)(i % 256);
-        }
-        
-        // Warmup
-        for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-            if (rank == 0) {
-                MPI_Send(send_buffer, msg_size, MPI_CHAR, 1 % size, 0, MPI_COMM_WORLD);
-                MPI_Recv(recv_buffer, msg_size, MPI_CHAR, 1 % size, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            } else if (rank == 1 % size) {
-                MPI_Recv(recv_buffer, msg_size, MPI_CHAR, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                MPI_Send(send_buffer, msg_size, MPI_CHAR, 0, 0, MPI_COMM_WORLD);
-            }
-        }
-        
-        MPI_Barrier(MPI_COMM_WORLD);
-        
-        // Actual test
-        start_time = MPI_Wtime();
-        
-        for (int i = 0; i < TEST_ITERATIONS; i++) {
-            if (rank == 0) {
-                MPI_Send(send_buffer, msg_size, MPI_CHAR, 1 % size, 0, MPI_COMM_WORLD);
-                MPI_Recv(recv_buffer, msg_size, MPI_CHAR, 1 % size, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            } else if (rank == 1 % size) {
-                MPI_Recv(recv_buffer, msg_size, MPI_CHAR, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                MPI_Send(send_buffer, msg_size, MPI_CHAR, 0, 0, MPI_COMM_WORLD);
-            }
-        }
-        
-        end_time = MPI_Wtime();
-        
-        if (rank == 0) {
-            double total_time = end_time - start_time;
-            latency = (total_time / (2.0 * TEST_ITERATIONS)) * 1e6; // microseconds
-            bandwidth = (msg_size * 2.0 * TEST_ITERATIONS) / total_time / (1024.0 * 1024.0); // MB/s
-            
-            if (msg_size < 1024) {
-                printf("Message Size: %d B   | Latency: %.2f μs | Bandwidth: %.2f MB/s\n", 
-                       msg_size, latency, bandwidth);
-            } else if (msg_size < 1048576) {
-                printf("Message Size: %d KB  | Latency: %.2f μs | Bandwidth: %.2f MB/s\n", 
-                       msg_size / 1024, latency, bandwidth);
-            } else {
-                printf("Message Size: %d MB  | Latency: %.2f μs | Bandwidth: %.2f MB/s\n", 
-                       msg_size / 1048576, latency, bandwidth);
-            }
-        }
-        
-        free(send_buffer);
-        free(recv_buffer);
-    }
-    
-    // All-to-all latency test
+
+    if (rank == 0) printf("=== MPI Latency/Bandwidth Benchmark ===\n");
+
+    // Ping-Pong Tests (Point-to-Point)
+    int p2p_sizes[] = { 1, 1024, 10240, 102400, 1048576 };
+    for (int i = 0; i < 5; i++) run_test("Ping-Pong", p2p_sizes[i], rank, size, 0);
+
+    // Collective Tests (Bcast = 1, All-to-all = 2)
     if (size > 1) {
-        MPI_Barrier(MPI_COMM_WORLD);
-        
-        if (rank == 0) {
-            printf("\n=== All-to-All Communication Test ===\n");
-        }
-        
-        int small_msg = 1024; // 1KB message
-        char* all_send_buffer = (char*)malloc(small_msg * size);
-        char* all_recv_buffer = (char*)malloc(small_msg * size);
-        
-        for (int i = 0; i < small_msg * size; i++) {
-            all_send_buffer[i] = (char)(rank + i % 256);
-        }
-        
-        MPI_Barrier(MPI_COMM_WORLD);
-        start_time = MPI_Wtime();
-        
-        for (int i = 0; i < TEST_ITERATIONS / 10; i++) {
-            MPI_Alltoall(all_send_buffer, small_msg, MPI_CHAR,
-                        all_recv_buffer, small_msg, MPI_CHAR,
-                        MPI_COMM_WORLD);
-        }
-        
-        end_time = MPI_Wtime();
-        
-        if (rank == 0) {
-            double total_time = end_time - start_time;
-            double avg_time = (total_time / (TEST_ITERATIONS / 10)) * 1e6; // microseconds
-            printf("All-to-All (1KB × %d): %.2f μs per operation\n", size, avg_time);
-        }
-        
-        free(all_send_buffer);
-        free(all_recv_buffer);
+        run_test("Broadcast", 1024, rank, size, 1);
+        run_test("Broadcast", 1048576, rank, size, 1);
+        run_test("All-to-All", 1024 * size, rank, size, 2);
     }
-    
-    // Broadcast latency test
-    MPI_Barrier(MPI_COMM_WORLD);
-    
-    if (rank == 0) {
-        printf("\n=== Broadcast Latency Test ===\n");
-    }
-    
-    for (int test = 0; test < 3; test++) {
-        int bcast_sizes[3] = {1024, 102400, 1048576}; // 1KB, 100KB, 1MB
-        int bcast_size = bcast_sizes[test];
-        char* bcast_buffer = (char*)malloc(bcast_size);
-        
-        if (rank == 0) {
-            for (int i = 0; i < bcast_size; i++) {
-                bcast_buffer[i] = (char)(i % 256);
-            }
-        }
-        
-        MPI_Barrier(MPI_COMM_WORLD);
-        start_time = MPI_Wtime();
-        
-        for (int i = 0; i < TEST_ITERATIONS / 10; i++) {
-            MPI_Bcast(bcast_buffer, bcast_size, MPI_CHAR, 0, MPI_COMM_WORLD);
-        }
-        
-        end_time = MPI_Wtime();
-        
-        if (rank == 0) {
-            double total_time = end_time - start_time;
-            double avg_time = (total_time / (TEST_ITERATIONS / 10)) * 1e6; // microseconds
-            
-            if (bcast_size < 1048576) {
-                printf("Broadcast %d KB: %.2f μs per operation\n", bcast_size / 1024, avg_time);
-            } else {
-                printf("Broadcast %d MB: %.2f μs per operation\n", bcast_size / 1048576, avg_time);
-            }
-        }
-        
-        free(bcast_buffer);
-    }
-    
-    if (rank == 0) {
-        printf("\n=== Test Complete ===\n");
-    }
-    
+
+    if (rank == 0) printf("=== Test Complete ===\n");
     MPI_Finalize();
     return 0;
 }
+#else 
+int main() {
+    printf("This program is designed to be run with MPI. Please compile with mpicc and run with mpirun.\n");
+    return 0;
+}
+#endif
