@@ -2,6 +2,24 @@
 
 A distributed image processing system built on a Raspberry Pi cluster using MPI (Message Passing Interface). This project simulates a Raspberry Pi cluster environment using Docker with ARM64 emulation, enabling development and testing on x86 machines.
 
+## Project Structure
+
+```
+rpi-vision-cluster/
+├── Makefile                  # Cluster management & compilation commands
+├── Dockerfile.cluster        # Container configuration with MPI, SSH, Python
+├── docker-compose.yml        # Scalable cluster definition (2-6 nodes)
+├── README.md                 # This file
+│
+└── workspace/                # All files here are mounted in cluster containers
+    ├── hello_cluster.py      # MPI test script
+    └── examples/             # Example MPI programs
+        ├── matrix_multiply.c     # 800x800 matrix multiplication with profiling
+        └── mpi_latency_test.c    # Communication benchmark (ping-pong, all-to-all)
+```
+
+---
+
 ## Quick Start
 
 ### 0. Prerequisites
@@ -79,24 +97,6 @@ Success! Cluster nodes found: ['master', 'worker1']
 ```
 
 **Note:** All workspace files are automatically available in containers at `/home/pi/workspace/` - no manual copying needed.
-
----
-
-## Project Structure
-
-```
-rpi-vision-cluster/
-├── Makefile                  # Cluster management & compilation commands
-├── Dockerfile.cluster        # Container configuration with MPI, SSH, Python
-├── docker-compose.yml        # Scalable cluster definition (2-6 nodes)
-├── README.md                 # This file
-│
-└── workspace/                # All files here are mounted in cluster containers
-    ├── hello_cluster.py      # MPI test script
-    └── examples/             # Example MPI programs
-        ├── matrix_multiply.c     # 800x800 matrix multiplication with profiling
-        └── mpi_latency_test.c    # Communication benchmark (ping-pong, all-to-all)
-```
 
 ---
 
