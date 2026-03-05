@@ -1,16 +1,449 @@
 # RPI Vision Cluster
 
-A distributed image processing system built on a Raspberry Pi cluster.
+A distributed image processing system built on a Raspberry Pi cluster using MPI (Message Passing Interface). This project simulates a Raspberry Pi cluster environment using Docker with ARM64 emulation, enabling development and testing on x86 machines.
+
+## Quick Start
+
+### 0. Prerequisites
+- Docker version 29.2.1 or later
+- Docker Compose version 5.0.2 or later
+- 8GB+ RAM recommended
+- 10GB+ disk space for images
+
+### 1. Makefile Commands
+
+The Makefile provides simple commands for all cluster operations. Run `make help` to see all available commands:
+
+```
+RPI Vision Cluster - Makefile Commands
+
+Setup:
+  make setup [NODES=2]  - Enable ARM64 emulation and build cluster (2-6 nodes)
+  make start [NODES=2]  - Start the cluster containers (2-6 nodes)
+  make stop             - Stop the cluster containers
+  make restart [NODES=2]- Restart the cluster with specified nodes
+
+Testing:
+  make verify     - Verify cluster is working
+  make test       - Run MPI test (hello_cluster.py)
+  make shell      - Open shell on master node
+
+Compilation:
+  make compile FILE=<file.c> [OUTPUT=name] - Compile C/C++ in cluster (ARM64 MPI)
+  make run FILE=<file> [NODES=2]        - Run program (binary or .py) on cluster
+
+Maintenance:
+  make logs       - Show container logs
+  make clean      - Stop and remove containers (keep images)
+  make destroy    - Complete removal (containers, volumes, images)
+
+Note: workspace/ folder is mounted at /home/pi/workspace/ on all nodes
+      Place source files in workspace/ and binaries will be compiled there
+
+Examples:
+  make setup NODES=4                         - Start cluster with 1 master + 3 workers
+  make compile FILE=matrix_multiply.c        - Compile C program in workspace/
+  make run FILE=matrix_multiply NODES=4      - Run compiled binary on 4 nodes
+  make run FILE=hello_cluster.py NODES=3     - Run Python script on 3 nodes
+```
+
+### 2. One-Command Setup
+
+```bash
+make setup          # Default: 2 nodes (1 master + 1 worker)
+make setup NODES=4  # 4 nodes (1 master + 3 workers)
+```
+
+This command will:
+1. Enable ARM64 emulation (if needed)
+2. Build and launch the cluster containers
+3. Configure MPI and SSH automatically
+4. Verify the setup
+
+**Node Configuration:**
+- Minimum: 2 nodes (1 master + 1 worker)
+- Maximum: 6 nodes (1 master + 5 workers)
+- Default: 2 nodes if not specified
+
+### 3. Verify Installation
+
+```bash
+make test NODES=2
+```
+
+Expected output:
+```
+Hello from rank 0 of 2 on host master
+Hello from rank 1 of 2 on host worker1
+Success! Cluster nodes found: ['master', 'worker1']
+```
+
+**Note:** All workspace files are automatically available in containers at `/home/pi/workspace/` - no manual copying needed.
+
+---
+
+## Project Structure
+
+```
+rpi-vision-cluster/
+├── Makefile                  # Cluster management & compilation commands
+├── Dockerfile.cluster        # Container configuration with MPI, SSH, Python
+├── docker-compose.yml        # Scalable cluster definition (2-6 nodes)
+├── README.md                 # This file
+│
+└── workspace/                # All files here are mounted in cluster containers
+    ├── hello_cluster.py      # MPI test script
+    └── examples/             # Example MPI programs
+        ├── matrix_multiply.c     # 800x800 matrix multiplication with profiling
+        └── mpi_latency_test.c    # Communication benchmark (ping-pong, all-to-all)
+```
+
+---
+
+## Working with the Cluster
+
+### Start/Stop the Cluster
+
+```bash
+# Start with default 2 nodes
+make start
+
+# Start with specific node count
+make start NODES=4
+
+# Stop all containers
+make stop
+
+# Restart with specific node count
+make restart NODES=3
+
+# Remove everything
+make destroy
+```
+
+### Access the Master Node
+
+```bash
+make shell
+```
+
+Inside the container, all workspace files are available at `/home/pi/workspace/`.
+
+### Check Status
+
+```bash
+make status
+```
+
+---
+
+## Compiling and Running Programs
+
+### Workspace Access
+
+All files in the `workspace/` folder are automatically mounted to `/home/pi/workspace/` in all containers. Place your programs in the workspace/ directory to make them available to the cluster.
+
+### Python Programs
+
+```bash
+# Run Python script directly
+make run FILE=hello_cluster.py NODES=2
+make run FILE=hello_cluster.py NODES=3
+```
+
+### C/C++ Programs
+
+```bash
+# Compile for cluster (ARM64 with MPI)
+make compile FILE=examples/matrix_multiply.c OUTPUT=matmul
+
+# Run compiled binary
+make run FILE=matmul NODES=2
+make run FILE=matmul NODES=5
+```
+
+### Advanced: Manual Execution
+
+```bash
+# Enter the master container
+make shell
+
+# Inside container, workspace is at /home/pi/workspace/
+cd /home/pi/workspace/
+
+# Compile
+mpicc examples/matrix_multiply.c -o matmul -lm
+
+# Run with custom MPI options
+mpirun -n 4 --host master,worker1,worker2,worker3 ./matmul
+```
+
+---
+
+## Makefile Command Reference
+
+### Cluster Lifecycle
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `make setup` | Build and start cluster | `make setup NODES=4` |
+| `make start` | Start existing cluster | `make start NODES=2` |
+| `make stop` | Stop all containers | `make stop` |
+| `make restart` | Stop and start | `make restart NODES=3` |
+| `make clean` | Remove containers (keep images) | `make clean` |
+| `make destroy` | Remove containers and images | `make destroy` |
+
+### Testing & Verification
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `make test` | Run hello_cluster.py test | `make test NODES=3` |
+| `make verify` | Verify cluster connectivity | `make verify NODES=5` |
+| `make shell` | SSH into master node | `make shell` |
+| `make status` | Show container status | `make status` |
+
+### Compilation & Execution
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `make compile` | Compile C/C++ for cluster (ARM64) | `make compile FILE=prog.c OUTPUT=prog` |
+| `make run` | Run program (binary or .py) | `make run FILE=prog NODES=4` |
+
+**Parameters:**
+- `NODES=N` - Number of nodes (2-6, default: 2)
+- `FILE=path` - Program file path (relative to workspace)
+- `OUTPUT=name` - Output binary name (for compile)
+
+---
+
+## Example Programs
+
+### 1. hello_cluster.py - MPI Synchronization Test
+
+Demonstrates proper MPI synchronization using `allgather()`:
+
+```bash
+make run FILE=hello_cluster.py NODES=2
+```
+
+**Why `allgather` vs `gather`?**
+- `gather(root=0)`: Only rank 0 receives data, other ranks can hang
+- `allgather()`: All ranks receive data, guaranteed synchronization
+
+### 2. matrix_multiply.c - Computational Benchmark
+
+800x800 matrix multiplication with MPI profiling:
+
+```bash
+# Compile
+make compile FILE=examples/matrix_multiply.c OUTPUT=matmul
+
+# Run on 2 nodes
+make run FILE=matmul NODES=2
+```
+
+**Features:**
+- Row-wise matrix distribution using `MPI_Scatter`
+- Broadcast matrix B with `MPI_Bcast`
+- Internal timing with `MPI_Wtime()` showing:
+  - Computation time (actual math)
+  - Communication time (MPI overhead)
+  - Per-process timing breakdown
+- GFLOPS calculation
+
+**Measured Results:**
+
+2 Nodes (1 master + 1 worker):
+```
+Matrix Size:       800x800
+Processes:         2
+Total Time:        42.9974 seconds
+Computation Time:  42.0376 seconds
+Communication Time: 0.2473 seconds
+Compute/Total:     97.77%
+Comm/Total:        0.58%
+Performance:       0.02 GFLOPS
+```
+
+5 Nodes (1 master + 4 workers):
+```
+Matrix Size:       800x800
+Processes:         5
+Total Time:        17.4313 seconds
+Computation Time:  12.1845 seconds
+Communication Time: 4.4696 seconds
+Compute/Total:     69.90%
+Comm/Total:        25.64%
+Performance:       0.08 GFLOPS
+```
+
+**Analysis:**
+- Speedup: 2.47x when going from 2 to 5 nodes
+- Communication overhead increases significantly: 0.58% to 25.64%
+- Computation time per node varies: 12.18s to 16.43s (load imbalance)
+
+### 3. mpi_latency_test.c - Communication Benchmark
+
+Measures MPI communication overhead across different patterns:
+
+```bash
+# Compile
+make compile FILE=examples/mpi_latency_test.c OUTPUT=latency_test
+
+# Run on 2 nodes
+make run FILE=latency_test NODES=2
+
+# Run on 5 nodes
+make run FILE=latency_test NODES=5
+```
+
+**Tests Performed:**
+1. **Ping-Pong Latency:** Round-trip time between master and worker1
+   - Message sizes: 1B, 1KB, 10KB, 100KB, 1MB
+   - 100 iterations with warmup
+   - Calculates bandwidth (MB/s)
+
+2. **All-to-All Communication:** Every process sends to every other process
+   - Tests O(n²) scaling behavior
+
+3. **Broadcast Latency:** Master broadcasts to all workers
+   - Message sizes: 1KB, 100KB, 1MB
+
+**Measured Results:**
+
+2 Nodes:
+```
+Message Size: 1 B    | Latency: 80.25 μs  | Bandwidth: 0.01 MB/s
+Message Size: 1 KB   | Latency: 103.41 μs | Bandwidth: 9.44 MB/s
+Message Size: 10 KB  | Latency: 94.45 μs  | Bandwidth: 103.39 MB/s
+Message Size: 100 KB | Latency: 521.31 μs | Bandwidth: 187.33 MB/s
+Message Size: 1 MB   | Latency: 1222.50 μs| Bandwidth: 818.00 MB/s
+
+All-to-All (1KB × 2): 525.90 μs per operation
+Broadcast 1 MB: 1674.03 μs per operation
+```
+
+5 Nodes:
+```
+Message Size: 1 B    | Latency: 48.00 μs  | Bandwidth: 0.02 MB/s
+Message Size: 1 KB   | Latency: 87.90 μs  | Bandwidth: 11.11 MB/s
+Message Size: 10 KB  | Latency: 94.79 μs  | Bandwidth: 103.02 MB/s
+Message Size: 100 KB | Latency: 484.04 μs | Bandwidth: 201.75 MB/s
+Message Size: 1 MB   | Latency: 1555.95 μs| Bandwidth: 642.70 MB/s
+
+All-to-All (1KB × 5): 19252.26 μs per operation
+Broadcast 1 MB: 5898.54 μs per operation
+```
+
+**Observations:**
+- All-to-All latency scales poorly: 525μs (2 nodes) → 19252μs (5 nodes) - 36x increase
+- Broadcast scales better: 1674μs (2 nodes) → 5899μs (5 nodes) - 3.5x increase
+- Peak bandwidth: 642-818 MB/s for 1MB messages
+
+---
+
+## Performance Measurement with MPI_Wtime()
+
+Add timing directly to your programs to measure computation vs communication overhead:
+
+```c
+#include <mpi.h>
+#include <stdio.h>
+
+int main(int argc, char** argv) {
+    double t_start, t_compute_start, t_compute_end;
+    
+    MPI_Init(&argc, &argv);
+    t_start = MPI_Wtime();
+    
+    // Your computation
+    t_compute_start = MPI_Wtime();
+    // ... your code ...
+    t_compute_end = MPI_Wtime();
+    
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    
+    if (rank == 0) {
+        printf("Computation time: %.6f s\n", t_compute_end - t_compute_start);
+        printf("Total time: %.6f s\n", MPI_Wtime() - t_start);
+    }
+    
+    MPI_Finalize();
+    return 0;
+}
+```
+
+See [examples/matrix_multiply.c](examples/matrix_multiply.c) for a complete implementation.
+
+---
 
 ## Milestones
 
-- [x] M0: Virtual cluster & toolchain setup
-- [ ] M1: Multi-threaded single-node processing
-- [ ] M2: Shared memory IPC & PRAM analysis
-- [ ] M3: Physical cluster assembly & MPI
-- [ ] M4: Non-blocking communication & failover
-- [ ] M5: Integration & final benchmarks
+- [x] **M0: Virtual cluster & toolchain setup**
+  - Docker-based ARM64 emulation (2-6 nodes)
+  - Automated setup with `make setup`
+  - Workspace volume mounting (no manual file copying)
+  - C/C++ and Python compilation workflows
+  - MPI latency and computation benchmarks
+- [ ] **M1: Multi-threaded single-node processing**
+- [ ] **M2: Shared memory IPC & PRAM analysis**
+- [ ] **M3: Physical cluster assembly & MPI**
+- [ ] **M4: Non-blocking communication & failover**
+- [ ] **M5: Integration & final benchmarks**
 
-## Status
+---
 
-Early development.
+## Troubleshooting
+
+### "Container not running"
+```bash
+make start NODES=2
+```
+
+### "Permission denied" errors
+```bash
+docker exec -u root rpic_master chown -R pi:pi /home/pi/
+```
+
+### "SSH connection refused"
+```bash
+# Wait a few seconds after starting containers
+sleep 3
+docker exec -u pi rpic_master mpirun -n 2 --host master,worker1 hostname
+```
+
+### ARM64 emulation not working
+```bash
+# Manually enable emulation
+docker run --privileged --rm tonistiigi/binfmt --install all
+
+# Verify
+docker buildx ls
+```
+
+### View container logs
+```bash
+docker logs rpic_master
+docker logs rpic_worker1
+```
+
+### File not found errors
+```bash
+# All workspace files are automatically mounted at /home/pi/workspace/
+# Use relative paths from project root:
+make run FILE=examples/program NODES=2
+
+# Or absolute paths inside container:
+make shell
+cd /home/pi/workspace/examples/
+./program
+```
+
+---
+
+## Additional Resources
+
+- [MPI4Py Documentation](https://mpi4py.readthedocs.io/) - Python MPI library
+- [OpenMPI Documentation](https://www.open-mpi.org/) - MPI implementation
+- [MPI Tutorial](https://mpitutorial.com/) - Comprehensive MPI guide
