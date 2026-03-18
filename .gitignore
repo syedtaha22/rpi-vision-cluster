@@ -30,4 +30,4 @@ __pycache__/
 docs/
 
 # Ignore archives/
-archives/
+archives/workspace/vision/datasets/
