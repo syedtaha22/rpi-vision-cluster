@@ -30,4 +30,10 @@ __pycache__/
 docs/
 
 # Ignore archives/
-archives/workspace/vision/datasets/
+archives/
+
+# Datasets
+workspace/vision/datasets/
+
+# Generated images
+*.png

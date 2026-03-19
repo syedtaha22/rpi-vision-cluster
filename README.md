@@ -216,6 +216,51 @@ mpirun -n 4 --host master,worker1,worker2,worker3 ./matmul
 
 ---
 
+## Vision Baselines & FFT Architectures
+
+We have implemented baseline edge detectors (Sobel, Canny, LoG) and four 2D Fast Fourier Transform (FFT) parallel architectures. The project uses `stb_image.h` and `stb_image_write.h`—lightweight, public domain, single-header C libraries—for image loading and saving without requiring heavy external dependencies like OpenCV.
+
+Before running, make sure to download the necessary datasets:
+```bash
+./download_substantial_datasets.sh
+```
+
+### 1. Compile the Vision Programs
+
+```bash
+# Compile Baselines
+make compile FILE=vision/baselines.cpp OUTPUT=baselines
+
+# Compile FFT Architectures
+make compile FILE=vision/fft_arch1_farm.cpp OUTPUT=fft_arch1
+make compile FILE=vision/fft_arch2_pipeline.cpp OUTPUT=fft_arch2
+make compile FILE=vision/fft_arch3_dist_dynamic.cpp OUTPUT=fft_arch3
+make compile FILE=vision/fft_arch4_dist_pipeline.cpp OUTPUT=fft_arch4
+```
+
+### 2. Run the Vision Programs
+
+Use the `ARGS` parameter to pass the image path to the compiled binary. Ensure your cluster is running first (`make start`).
+
+```bash
+# Run Baselines (Sequential, 1 node)
+make run FILE=baselines NODES=1 ARGS="vision/datasets/coco-val2017/000000000139.jpg"
+
+# Run Architecture 1: Single Node Farm (OpenMP)
+make run FILE=fft_arch1 NODES=1 ARGS="vision/datasets/cifar-10/data_batch_1_img_0.png"
+
+# Run Architecture 2: Single Node Pipeline (OpenMP)
+make run FILE=fft_arch2 NODES=1 ARGS="vision/datasets/tiny-imagenet-200/test/images/test_0.JPEG"
+
+# Run Architecture 3: Distributed Dynamic (MPI Scatter/Gather)
+make run FILE=fft_arch3 NODES=4 ARGS="vision/datasets/coco-val2017/000000000139.jpg"
+
+# Run Architecture 4: Distributed Pipeline (MPI)
+make run FILE=fft_arch4 NODES=2 ARGS="vision/datasets/coco-val2017/000000000139.jpg"
+```
+
+---
+
 ## Example Programs
 
 ### 1. hello_cluster.py - MPI Synchronization Test

@@ -4,6 +4,7 @@
 NODES ?= 2
 FILE ?=
 OUTPUT ?= a.out
+ARGS ?=
 
 # Map node count to profile
 PROFILE_2 = --profile 2-nodes
@@ -17,6 +18,7 @@ PROFILE = $(PROFILE_$(NODES))
 ALL_PROFILES = --profile 2-nodes --profile 3-nodes --profile 4-nodes --profile 5-nodes --profile 6-nodes
 
 # Build hostlist dynamically based on NODES
+HOSTLIST_1 = master
 HOSTLIST_2 = master,worker1
 HOSTLIST_3 = master,worker1,worker2
 HOSTLIST_4 = master,worker1,worker2,worker3
@@ -158,9 +160,9 @@ compile:
 	BASENAME=$${BASENAME%.cpp}; \
 	OUT=$${OUTPUT:-$$BASENAME}; \
 	if [ "$$EXT" = "cpp" ] || [ "$$EXT" = "cc" ]; then \
-		docker exec -u pi rpic_master bash -c "cd /home/pi/workspace && mpic++ $(FILE) -o $$OUT -lm -O2"; \
+		docker exec -u pi rpic_master bash -c "cd /home/pi/workspace && mpic++ $(FILE) -o $$OUT -lm -O2 -fopenmp"; \
 	else \
-		docker exec -u pi rpic_master bash -c "cd /home/pi/workspace && mpicc $(FILE) -o $$OUT -lm -O2"; \
+		docker exec -u pi rpic_master bash -c "cd /home/pi/workspace && mpicc $(FILE) -o $$OUT -lm -O2 -fopenmp"; \
 	fi
 	@echo "Compiled in cluster: $(FILE) -> workspace/$${OUTPUT:-$$(basename $(FILE) | sed 's/\.[^.]*$$//')}"
 
@@ -175,8 +177,8 @@ run:
 	@echo ""
 	@EXT=$${FILE##*.}; \
 	if [ "$$EXT" = "py" ]; then \
-		docker exec -u pi rpic_master mpirun -n $(NODES) --host $(HOSTLIST) python3 /home/pi/workspace/$(FILE); \
+		docker exec -u pi rpic_master bash -c "cd /home/pi/workspace && mpirun -n $(NODES) --host $(HOSTLIST) python3 /home/pi/workspace/$(FILE) $(ARGS)"; \
 	else \
-		docker exec -u pi rpic_master mpirun -n $(NODES) --host $(HOSTLIST) /home/pi/workspace/$(FILE); \
+		docker exec -u pi rpic_master bash -c "cd /home/pi/workspace && mpirun -n $(NODES) --host $(HOSTLIST) /home/pi/workspace/$(FILE) $(ARGS)"; \
 	fi
 	@echo ""
