@@ -69,12 +69,15 @@ int main(int argc, char** argv) {
         for(int y = 0; y < new_h; ++y) data[y * new_w + x] = col[y];
     }
 
-    // 3. High Pass Filter
-    int cx = new_w / 2, cy = new_h / 2, r = 10;
+    // 3. Gaussian High Pass Filter (GHPF)
+    int cx = new_w / 2, cy = new_h / 2;
+    double d0 = 10.0;
     #pragma omp parallel for collapse(2)
     for (int y = 0; y < new_h; ++y) {
         for (int x = 0; x < new_w; ++x) {
-            if ((x-cx)*(x-cx) + (y-cy)*(y-cy) < r*r) data[y * new_w + x] = 0;
+            double d2 = (double)(x - cx) * (x - cx) + (double)(y - cy) * (y - cy);
+            double h = 1.0 - exp(-d2 / (2.0 * d0 * d0));
+            data[y * new_w + x] *= h;
         }
     }
 

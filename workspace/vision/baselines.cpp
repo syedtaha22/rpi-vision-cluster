@@ -238,14 +238,14 @@ vector<unsigned char> fft_edge_detection(const vector<unsigned char>& img, int w
         for (int y = 0; y < nh; y++) data[y * nw + x] = col[y];
     }
 
-    // High Pass Filter: Zero out low frequencies in the center
+    // Gaussian High Pass Filter (GHPF): 1 - exp(-D^2 / (2 * D0^2))
     int cx = nw / 2, cy = nh / 2;
-    int r = 10; // cutoff radius
+    double d0 = 10.0; 
     for (int y = 0; y < nh; y++) {
         for (int x = 0; x < nw; x++) {
-            if (pow(x - cx, 2) + pow(y - cy, 2) < pow(r, 2)) {
-                data[y * nw + x] = 0;
-            }
+            double d2 = pow(x - cx, 2) + pow(y - cy, 2);
+            double h = 1.0 - exp(-d2 / (2.0 * d0 * d0));
+            data[y * nw + x] *= h;
         }
     }
 

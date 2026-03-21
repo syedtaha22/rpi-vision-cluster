@@ -80,16 +80,19 @@ int main(int argc, char** argv) {
     vector<Complex> local_cols(cols_per_proc * new_h);
     MPI_Scatter(data.data(), cols_per_proc * new_h * 2, MPI_DOUBLE, local_cols.data(), cols_per_proc * new_h * 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     
-    int cx = new_w / 2, cy = new_h / 2, r = 10;
+    int cx = new_w / 2, cy = new_h / 2;
+    double d0 = 10.0;
     for (int x = 0; x < cols_per_proc; ++x) {
         int global_x = rank * cols_per_proc + x;
         vector<Complex> col(new_h);
         for(int y = 0; y < new_h; ++y) col[y] = local_cols[x * new_h + y];
         fft1d(col);
         
-        // Filter + IFFT
+        // GHPF + IFFT
         for(int y = 0; y < new_h; ++y) {
-            if ((global_x-cx)*(global_x-cx) + (y-cy)*(y-cy) < r*r) col[y] = 0;
+            double d2 = (double)(global_x - cx) * (global_x - cx) + (double)(y - cy) * (y - cy);
+            double h = 1.0 - exp(-d2 / (2.0 * d0 * d0));
+            col[y] *= h;
         }
         ifft1d(col);
         for(int y = 0; y < new_h; ++y) local_cols[x * new_h + y] = col[y];

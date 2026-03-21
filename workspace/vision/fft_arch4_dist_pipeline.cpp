@@ -65,14 +65,17 @@ int main(int argc, char** argv) {
         data.resize(nw * nh);
         MPI_Recv(data.data(), nw * nh * 2, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-        // Stage 2: Col Pass Forward + HPF + Col Pass Inverse
-        int cx = nw / 2, cy = nh / 2, r = 10;
+        // Stage 2: Col Pass Forward + GHPF + Col Pass Inverse
+        int cx = nw / 2, cy = nh / 2;
+        double d0 = 10.0;
         for (int x = 0; x < nw; ++x) {
             vector<Complex> col(nh);
             for(int y = 0; y < nh; ++y) col[y] = data[y * nw + x];
             fft1d(col);
             for(int y = 0; y < nh; ++y) {
-                if ((x-cx)*(x-cx) + (y-cy)*(y-cy) < r*r) col[y] = 0;
+                double d2 = (double)(x - cx) * (x - cx) + (double)(y - cy) * (y - cy);
+                double h = 1.0 - exp(-d2 / (2.0 * d0 * d0));
+                col[y] *= h;
             }
             ifft1d(col);
             for(int y = 0; y < nh; ++y) data[y * nw + x] = col[y];

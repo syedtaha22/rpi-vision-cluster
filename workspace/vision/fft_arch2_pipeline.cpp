@@ -58,19 +58,22 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Stage 2: Forward Columns + HPF + Inverse Columns
+    // Stage 2: Forward Columns + GHPF + Inverse Columns
     #pragma omp parallel sections
     {
         #pragma omp section
         {
-            int cx = new_w / 2, cy = new_h / 2, r = 10;
+            int cx = new_w / 2, cy = new_h / 2;
+            double d0 = 10.0;
             for (int x = 0; x < new_w; ++x) {
                 vector<Complex> col(new_h);
                 for(int y = 0; y < new_h; ++y) col[y] = data[y * new_w + x];
                 fft1d(col);
-                // Apply Filter in-place during column pass
+                // Apply GHPF in-place during column pass
                 for(int y = 0; y < new_h; ++y) {
-                    if ((x-cx)*(x-cx) + (y-cy)*(y-cy) < r*r) col[y] = 0;
+                    double d2 = (double)(x - cx) * (x - cx) + (double)(y - cy) * (y - cy);
+                    double h = 1.0 - exp(-d2 / (2.0 * d0 * d0));
+                    col[y] *= h;
                 }
                 ifft1d(col);
                 for(int y = 0; y < new_h; ++y) data[y * new_w + x] = col[y];
