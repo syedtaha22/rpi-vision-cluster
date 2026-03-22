@@ -220,10 +220,19 @@ mpirun -n 4 --host master,worker1,worker2,worker3 ./matmul
 
 We have implemented baseline edge detectors (Sobel, Canny, LoG) and four 2D Fast Fourier Transform (FFT) parallel architectures. The project uses `stb_image.h` and `stb_image_write.h`—lightweight, public domain, single-header C libraries—for image loading and saving without requiring heavy external dependencies like OpenCV.
 
-Before running, make sure to download the necessary datasets:
+### 1. Dataset Preparation
+
+Before running the vision programs, you must download the necessary datasets. We provide a script that downloads and prepares CIFAR-10, Tiny ImageNet, and COCO (2017 Val) datasets.
+
 ```bash
+# Download and extract datasets (approx. 1.2GB total)
 ./download_substantial_datasets.sh
 ```
+
+This will populate `workspace/vision/datasets/` with:
+- `cifar-10/`: Small 32x32 images.
+- `tiny-imagenet-200/`: Medium 64x64 images.
+- `coco-val2017/`: Large, high-resolution images.
 
 ### 1. Compile the Vision Programs
 
@@ -258,6 +267,25 @@ make run FILE=fft_arch3 NODES=4 ARGS="vision/datasets/coco-val2017/000000000139.
 # Run Architecture 4: Distributed Pipeline (MPI)
 make run FILE=fft_arch4 NODES=2 ARGS="vision/datasets/coco-val2017/000000000139.jpg"
 ```
+
+### 3. Automated Performance Analysis
+
+We provide an automated script to run benchmarks across different architectures, node counts, and thread counts. This script generates a comprehensive log of the results.
+
+```bash
+# Ensure the cluster is running (e.g., with 6 nodes)
+make start NODES=6
+
+# Run the full analysis suite
+./run_analysis.sh
+```
+
+The script will:
+- Test Serial Baselines.
+- Test OpenMP scaling (Arch 1) with 1, 2, and 4 threads.
+- Test MPI scaling (Arch 3) with 2, 4, and 6 nodes.
+- Test fixed configurations for Arch 2 and Arch 4.
+- Save all results to `analysis_results.log`.
 
 ---
 
