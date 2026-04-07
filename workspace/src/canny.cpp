@@ -72,7 +72,7 @@ float* CannyDetector::gaussian_blur(const uint8_t* input, int width, int height)
 }
 
 bool CannyDetector::non_maximum_suppression(const float* magnitude, const int* direction,
-                                             int width, int height, uint8_t* output) {
+    int width, int height, uint8_t* output) {
     std::memset(output, 0, width * height);
 
     for (int y = 1; y < height - 1; y++) {
