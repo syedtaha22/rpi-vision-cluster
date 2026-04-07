@@ -1,0 +1,3 @@
+Algorithm,Image_File,Width,Height,Pixel_Count,Time_ms,Throughput_MPS,Status
+Sobel,5.png,1920,1080,2073600,26.817900,77.321490,PASS
+Canny,5.png,1920,1080,2073600,186.674053,11.108132,PASS
