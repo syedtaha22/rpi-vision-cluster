@@ -7,7 +7,10 @@
 *.vcd
 *.log
 
-# Build directories
+# Build artifacts
+*.o
+*.a
+*.so
 build/
 benchmark_results/
 
@@ -31,3 +34,9 @@ docs/
 
 # Ignore archives/
 archives/
+
+# Ignore benchmark results
+results/
+
+# Datasets and Images
+images/
