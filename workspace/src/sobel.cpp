@@ -33,6 +33,38 @@ int SobelDetector::direction(int gx, int gy) {
     return 3;                                        // 135°
 }
 
+bool SobelDetector::compute_gradients(const float* input, int width, int height,
+                                      float* magnitude, int* direction) {
+    if (!input || !magnitude || !direction || width < 3 || height < 3) {
+        return false;
+    }
+
+    // Process interior pixels (leave border as 0)
+    for (int y = 1; y < height - 1; y++) {
+        for (int x = 1; x < width - 1; x++) {
+            int gx = 0, gy = 0;
+
+            // Apply Sobel operators
+            for (int ky = -1; ky <= 1; ky++) {
+                for (int kx = -1; kx <= 1; kx++) {
+                    int pixel_idx = (y + ky) * width + (x + kx);
+                    float pixel = input[pixel_idx];
+                    gx += static_cast<int>(SOBEL_X[ky + 1][kx + 1] * pixel);
+                    gy += static_cast<int>(SOBEL_Y[ky + 1][kx + 1] * pixel);
+                }
+            }
+
+            // Compute magnitude and direction
+            int output_idx = y * width + x;
+            magnitude[output_idx] = std::sqrt(gx * gx + gy * gy);
+            direction[output_idx] = SobelDetector::direction(gx, gy);
+        }
+    }
+
+    return true;
+}
+
+
 bool SobelDetector::process(const uint8_t* input, int width, int height, uint8_t* output) {
     if (!input || !output || width < 3 || height < 3) {
         return false;

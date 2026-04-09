@@ -19,6 +19,19 @@ public:
     bool process(const uint8_t* input, int width, int height, uint8_t* output);
 
     /**
+     * Compute Sobel gradients (magnitude and direction) from floating-point image
+     * Used internally by Sobel and exposed for Canny edge detection
+     * @param input Grayscale input image as floats (width x height pixels)
+     * @param width Image width in pixels
+     * @param height Image height in pixels
+     * @param magnitude Pre-allocated output buffer for magnitude (width x height floats)
+     * @param direction Pre-allocated output buffer for direction (width x height ints)
+     * @return true if successful, false otherwise
+     */
+    static bool compute_gradients(const float* input, int width, int height,
+                                  float* magnitude, int* direction);
+
+    /**
      * Get magnitude of gradient at pixel
      * @param gx X-direction gradient
      * @param gy Y-direction gradient

@@ -4,6 +4,7 @@
 #include <cstring>
 #include <algorithm>
 #include <queue>
+#include <vector>
 
 CannyDetector::CannyDetector(uint8_t low_threshold, uint8_t high_threshold, float sigma)
     : low_threshold(low_threshold), high_threshold(high_threshold), sigma(sigma) {}
@@ -172,7 +173,7 @@ bool CannyDetector::process(const uint8_t* input, int width, int height, uint8_t
     float* blurred = gaussian_blur(input, width, height);
     if (!blurred) return false;
 
-    // Stage 2: Compute Sobel gradients
+    // Stage 2: Compute Sobel gradients using shared detector
     float* magnitude = new float[width * height];
     int* direction = new int[width * height];
 
@@ -183,37 +184,7 @@ bool CannyDetector::process(const uint8_t* input, int width, int height, uint8_t
         return false;
     }
 
-    static const int SOBEL_X[3][3] = {
-        {-1, 0, 1},
-        {-2, 0, 2},
-        {-1, 0, 1}
-    };
-
-    static const int SOBEL_Y[3][3] = {
-        {-1, -2, -1},
-        {0, 0, 0},
-        {1, 2, 1}
-    };
-
-    for (int y = 1; y < height - 1; y++) {
-        for (int x = 1; x < width - 1; x++) {
-            int gx = 0, gy = 0;
-
-            // Apply Sobel operators on blurred image
-            for (int ky = -1; ky <= 1; ky++) {
-                for (int kx = -1; kx <= 1; kx++) {
-                    int pixel_idx = (y + ky) * width + (x + kx);
-                    float pixel = blurred[pixel_idx];
-                    gx += static_cast<int>(SOBEL_X[ky + 1][kx + 1] * pixel);
-                    gy += static_cast<int>(SOBEL_Y[ky + 1][kx + 1] * pixel);
-                }
-            }
-
-            int idx = y * width + x;
-            magnitude[idx] = std::sqrt(gx * gx + gy * gy);
-            direction[idx] = SobelDetector::direction(gx, gy);
-        }
-    }
+    SobelDetector::compute_gradients(blurred, width, height, magnitude, direction);
 
     // Stage 3: Non-maximum suppression
     non_maximum_suppression(magnitude, direction, width, height, output);
