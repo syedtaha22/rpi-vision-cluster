@@ -50,7 +50,6 @@ detector: $(TEST_DETECTOR)
 
 # Cleanup
 clean:
-	rm -rf $(BUILD_DIR)
-	find $(RESULTS_DIR) -type f \( -name "*.png" -o -name "*.jpg" \) -delete
+	rm -rf $(BUILD_DIR) $(RESULTS_DIR)
 
 .PRECIOUS: $(BUILD_DIR)/%.o
