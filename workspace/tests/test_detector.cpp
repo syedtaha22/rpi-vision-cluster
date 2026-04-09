@@ -89,6 +89,7 @@ int main(int argc, char* argv[]) {
     parser.add("-n", "--number", true, "Number of images to test (default: 1)");
     parser.add("-r", "--random", false, "Randomly select images");
     parser.add("-o", "--output", true, "Save output images: true or false (default: true)");
+    parser.add("-s", "--seed", true, "Random seed (default: 42)");
     parser.parse(argc, argv);
 
     if (!parser.is_valid()) {
@@ -119,53 +120,59 @@ int main(int argc, char* argv[]) {
     int num_images = parser.get<int>("--number", 1);
     bool random_select = parser.has("--random");
     bool save_output = parser.get<bool>("--output", true);
+    unsigned int seed = parser.get<int>("--seed", 42);
 
     // Create result directories
     std::string base_dir = "results/" + detector_name;
     std::string images_dir = base_dir + "/images";
     fs::create_directories(images_dir);
 
-    // Scan available images
+    // Scan available image paths (without loading)
     std::cout << "=== " << detector_name << " Detector Test ===" << std::endl;
     std::cout << "Scanning images..." << std::endl;
 
-    std::vector<ImageInfo> available_images;
+    std::vector<std::string> image_paths;
     if (fs::exists("images") && fs::is_directory("images")) {
         for (const auto& entry : fs::directory_iterator("images")) {
             if (entry.path().extension() == ".png" || entry.path().extension() == ".jpg") {
-                Image img = ImageIO::load_grayscale(entry.path().string());
-                if (img.is_valid()) {
-                    ImageInfo info;
-                    info.path = entry.path().string();
-                    info.filename = entry.path().filename().string();
-                    info.width = img.width;
-                    info.height = img.height;
-                    info.pixel_count = img.pixel_count();
-                    available_images.push_back(info);
-                }
+                image_paths.push_back(entry.path().string());
             }
         }
     }
 
-    if (available_images.empty()) {
+    if (image_paths.empty()) {
         std::cerr << "ERROR: No images found in images/ directory\n";
         return 1;
     }
 
-    std::cout << "Found " << available_images.size() << " images" << std::endl;
+    std::cout << "Found " << image_paths.size() << " images" << std::endl;
 
-    // Select images to test
-    std::vector<ImageInfo> test_images;
+    // Select and shuffle image paths
+    std::mt19937 rng(seed);
     if (random_select) {
-        std::shuffle(available_images.begin(), available_images.end(),
-            std::mt19937(std::random_device{}()));
+        std::shuffle(image_paths.begin(), image_paths.end(), rng);
     }
 
-    num_images = std::min(num_images, (int)available_images.size());
-    test_images.assign(available_images.begin(), available_images.begin() + num_images);
+    num_images = std::min(num_images, (int)image_paths.size());
+    std::vector<std::string> selected_paths(image_paths.begin(), image_paths.begin() + num_images);
+
+    // Load metadata only for selected images
+    std::vector<ImageInfo> test_images;
+    for (const auto& path : selected_paths) {
+        Image img = ImageIO::load_grayscale(path);
+        if (img.is_valid()) {
+            ImageInfo info;
+            info.path = path;
+            info.filename = fs::path(path).filename().string();
+            info.width = img.width;
+            info.height = img.height;
+            info.pixel_count = img.pixel_count();
+            test_images.push_back(info);
+        }
+    }
 
     std::cout << "Testing " << test_images.size() << " images (random: "
-        << (random_select ? "yes" : "no") << ")" << std::endl;
+        << (random_select ? "yes, seed " + std::to_string(seed) : "no") << ")" << std::endl;
     if (!save_output) {
         std::cout << "Output images will NOT be saved" << std::endl;
     }
