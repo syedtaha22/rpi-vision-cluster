@@ -90,6 +90,7 @@ int main(int argc, char* argv[]) {
     parser.add("-r", "--random", false, "Randomly select images");
     parser.add("-o", "--output", true, "Save output images: true or false (default: true)");
     parser.add("-s", "--seed", true, "Random seed (default: 42)");
+    parser.add("-i", "--images-path", true, "Path to images directory (default: images)");
     parser.parse(argc, argv);
 
     if (!parser.is_valid()) {
@@ -121,6 +122,7 @@ int main(int argc, char* argv[]) {
     bool random_select = parser.has("--random");
     bool save_output = parser.get<bool>("--output", true);
     unsigned int seed = parser.get<int>("--seed", 42);
+    std::string images_path = parser.get<std::string>("--images-path", "images");
 
     // Create result directories
     std::string base_dir = "results/" + detector_name;
@@ -132,8 +134,8 @@ int main(int argc, char* argv[]) {
     std::cout << "Scanning images..." << std::endl;
 
     std::vector<std::string> image_paths;
-    if (fs::exists("images") && fs::is_directory("images")) {
-        for (const auto& entry : fs::directory_iterator("images")) {
+    if (fs::exists(images_path) && fs::is_directory(images_path)) {
+        for (const auto& entry : fs::directory_iterator(images_path)) {
             if (entry.path().extension() == ".png" || entry.path().extension() == ".jpg") {
                 image_paths.push_back(entry.path().string());
             }
@@ -141,7 +143,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (image_paths.empty()) {
-        std::cerr << "ERROR: No images found in images/ directory\n";
+        std::cerr << "ERROR: No images found in " << images_path << "\n";
         return 1;
     }
 
