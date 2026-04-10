@@ -14,8 +14,13 @@
 build/
 benchmark_results/
 
-# Python cache
+# Python
 __pycache__/
+.venv
+scripts/
+
+# Ignore all .venv directories
+**/.venv/
 
 # LaTeX / Paper build artifacts
 *.aux
@@ -40,3 +45,4 @@ results/
 
 # Datasets and Images
 images/
+BSDS500/
