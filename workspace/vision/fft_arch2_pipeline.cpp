@@ -98,15 +98,18 @@ int main(int argc, char** argv) {
     double t_end = get_time();
     cout << "FFT Arch2 (Pipeline) Time: " << (t_end - t_start) << " s.\n";
     
-    vector<unsigned char> out(width * height);
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            double sign = ((x + y) % 2 == 0) ? 1.0 : -1.0;
-            double val = data[y * new_w + x].real() * sign;
-            out[y * width + x] = (unsigned char)max(0.0, min(255.0, val + 128.0));
-        }
+    float max_edge = 0.0f;
+    for (int i = 0; i < new_w * new_h; ++i) {
+        float mag = sqrt(data[i].real() * data[i].real() + data[i].imag() * data[i].imag());
+        if (mag > max_edge) max_edge = mag;
     }
-    stbi_write_png("fft_arch2_out.png", width, height, 1, out.data(), width);
+
+    vector<unsigned char> out(new_w * new_h);
+    for (int i = 0; i < new_w * new_h; ++i) {
+        float mag = sqrt(data[i].real() * data[i].real() + data[i].imag() * data[i].imag());
+        out[i] = (unsigned char)(255.0f * mag / max_edge);
+    }
+    stbi_write_png("fft_arch2_out.png", new_w, new_h, 1, out.data(), new_w);
     
     return 0;
 }
