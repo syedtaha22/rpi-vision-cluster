@@ -95,15 +95,19 @@ int main(int argc, char** argv) {
         double t_end = MPI_Wtime();
         cout << "FFT Arch4 (Dist Pipeline) Total Time: " << (t_end - t_start) << " s.\n";
         
-        vector<unsigned char> out(dims[2] * dims[3]);
-        for (int y = 0; y < dims[3]; ++y) {
-            for (int x = 0; x < dims[2]; ++x) {
-                double sign = ((x + y) % 2 == 0) ? 1.0 : -1.0;
-                double val = data[y * dims[0] + x].real() * sign;
-                out[y * dims[2] + x] = (unsigned char)max(0.0, min(255.0, val + 128.0));
-            }
+        int nw = dims[0], nh = dims[1];
+        float max_edge = 0.0f;
+        for (int i = 0; i < nw * nh; ++i) {
+            float mag = sqrt(data[i].real() * data[i].real() + data[i].imag() * data[i].imag());
+            if (mag > max_edge) max_edge = mag;
         }
-        stbi_write_png("fft_arch4_out.png", dims[2], dims[3], 1, out.data(), dims[2]);
+
+        vector<unsigned char> out(nw * nh);
+        for (int i = 0; i < nw * nh; ++i) {
+            float mag = sqrt(data[i].real() * data[i].real() + data[i].imag() * data[i].imag());
+            out[i] = (unsigned char)(255.0f * mag / max_edge);
+        }
+        stbi_write_png("fft_arch4_out.png", nw, nh, 1, out.data(), nw);
     }
 
     MPI_Finalize();
