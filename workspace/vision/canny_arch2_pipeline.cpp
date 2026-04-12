@@ -11,6 +11,7 @@
 #include <vector>
 #include <queue>
 #include <atomic>
+#include <memory>
 #include <algorithm>
 #include <omp.h>
 #include <cstdio>
@@ -45,10 +46,15 @@ int main(int argc, char** argv) {
     std::vector<float>         nms_map(N, 0.0f);
     std::vector<unsigned char> edge(N, 0), out(N, 0);
 
-    // Completion flags: done[stage][chunk] = 1 when that stage finished that chunk
-    std::vector<std::vector<std::atomic<int>>> done(4,
-        std::vector<std::atomic<int>>(num_chunks));
-    for (auto& stage : done) for (auto& f : stage) f.store(0);
+    // Completion flags: done[stage * num_chunks + chunk] = 1 when done.
+    // unique_ptr<atomic[]> avoids GCC 10 copy-construction error on ARM64
+    // (vector<atomic<int>>(N) triggers copy-ctor path in that toolchain).
+    int total_flags = 4 * num_chunks;
+    auto done = std::make_unique<std::atomic<int>[]>(total_flags);
+    for (int i = 0; i < total_flags; ++i) done[i].store(0);
+    auto done_flag = [&](int stage, int chunk) -> std::atomic<int>& {
+        return done[stage * num_chunks + chunk];
+    };
 
     double t0 = omp_get_wtime();
 
@@ -70,7 +76,7 @@ int main(int argc, char** argv) {
                                      * GAUSS5[ky+2][kx+2];
                         smooth[y*width+x] = s / GAUSS5_SUM;
                     }
-                done[0][c].store(1);
+                done_flag(0,c).store(1);
             }
         }
 
@@ -78,7 +84,7 @@ int main(int argc, char** argv) {
         #pragma omp section
         {
             for (int c = 0; c < num_chunks; ++c) {
-                while (done[0][c].load() == 0) { /* spin-wait for Gaussian */ }
+                while (done_flag(0,c).load() == 0) { /* spin-wait for Gaussian */ }
                 int y0 = c * chunk_rows;
                 int y1 = std::min(height, y0 + chunk_rows);
                 for (int y = y0; y < y1; ++y)
@@ -95,7 +101,7 @@ int main(int argc, char** argv) {
                         float a = std::atan2(gy,gx)*180.0f/(float)M_PI;
                         angle_map[y*width+x] = (a < 0) ? a+180.0f : a;
                     }
-                done[1][c].store(1);
+                done_flag(1,c).store(1);
             }
         }
 
@@ -103,7 +109,7 @@ int main(int argc, char** argv) {
         #pragma omp section
         {
             for (int c = 0; c < num_chunks; ++c) {
-                while (done[1][c].load() == 0) { /* spin-wait for gradient */ }
+                while (done_flag(1,c).load() == 0) { /* spin-wait for gradient */ }
                 int y0 = std::max(1, c * chunk_rows);
                 int y1 = std::min(height-1, (c+1) * chunk_rows);
                 for (int y = y0; y < y1; ++y)
@@ -117,7 +123,7 @@ int main(int argc, char** argv) {
                         nms_map[y*width+x] = (mag[y*width+x]>=q && mag[y*width+x]>=r)
                                              ? mag[y*width+x] : 0.0f;
                     }
-                done[2][c].store(1);
+                done_flag(2,c).store(1);
             }
         }
 
@@ -126,7 +132,7 @@ int main(int argc, char** argv) {
         {
             // Wait for all NMS chunks before global hysteresis BFS
             for (int c = 0; c < num_chunks; ++c)
-                while (done[2][c].load() == 0) { /* spin-wait */ }
+                while (done_flag(2,c).load() == 0) { /* spin-wait */ }
 
             static const unsigned char STRONG=255, WEAK=50;
             for (int i=0; i<N; ++i) {
