@@ -48,7 +48,6 @@ fi
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# ALL outputs — logs, csvs, images — go here
 OUT_DIR="$SCRIPT_DIR/report_bsds"
 LOG_FILE="$OUT_DIR/analysis_bsds.log"
 WS="$SCRIPT_DIR/workspace"
@@ -75,36 +74,118 @@ command -v docker &>/dev/null || die "Docker not found on PATH"
 docker compose version &>/dev/null || docker-compose --version &>/dev/null || die "Docker Compose not found"
 log "Docker OK"
 
+# ── ARM64 Emulation ───────────────────────────────────────────────────────────
+# Required on x86_64 hosts — the cluster images are built for linux/arm64
+# (simulating Raspberry Pi hardware). QEMU binfmt_misc handles the translation.
+section "STEP 0b: Enabling ARM64 (QEMU) Emulation"
+HOST_ARCH="$(uname -m)"
+log "  Host architecture: $HOST_ARCH"
+
+if [[ "$HOST_ARCH" == "x86_64" || "$HOST_ARCH" == "amd64" ]]; then
+    if [[ -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]] && \
+       grep -q "enabled" /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null; then
+        log "  ARM64 emulation already enabled — skipping"
+    else
+        log "  Enabling ARM64 emulation via tonistiigi/binfmt..."
+        docker run --privileged --rm tonistiigi/binfmt --install all \
+            2>&1 | tee -a "$LOG_FILE" \
+            || die "Failed to enable ARM64 emulation. Try: docker run --privileged --rm tonistiigi/binfmt --install all"
+        log "  ARM64 emulation enabled"
+    fi
+else
+    log "  Native ARM64 host — no emulation needed"
+fi
+
 # ── Cluster helpers ───────────────────────────────────────────────────────────
 MAX_NODES="${NODE_COUNTS[-1]}"
 
 master_running() {
-    docker ps --filter "name=rpic_master" --filter "status=running" \
-               --format "{{.Names}}" 2>/dev/null | grep -q "rpic_master"
+    # Check the container exists AND is actually running (not just created/exited)
+    local status
+    status=$(docker inspect --format '{{.State.Status}}' rpic_master 2>/dev/null)
+    [[ "$status" == "running" ]]
+}
+
+master_healthy() {
+    # Confirm we can actually exec into the master (guards against arm64 exec errors)
+    docker exec -u pi rpic_master echo "ok" &>/dev/null
+}
+
+images_exist() {
+    # Returns true only if the master image already exists locally
+    docker image inspect pdc_project-master &>/dev/null
 }
 
 ensure_cluster() {
     local n="$MAX_NODES"
-    if master_running; then
+
+    # ── Best case: cluster is already up and healthy ───────────────────────
+    if master_running && master_healthy; then
         local running
         running=$(docker ps --filter "name=rpic_" --filter "status=running" \
                              --format "{{.Names}}" 2>/dev/null | wc -l)
         if [[ $running -ge $n ]]; then
-            log "  Cluster already running ($running containers)"; return 0
+            log "  Cluster already running and healthy ($running containers) — skipping start"
+            return 0
         fi
-        log "  Only $running container(s) running, need $n — restarting..."
-    else
-        log "  Cluster not running — starting with $n nodes..."
+        log "  Master healthy but only $running/$n containers up — starting missing workers..."
+        cd "$SCRIPT_DIR"
+        docker compose --profile "${n}-nodes" up -d \
+            2>&1 | tee -a "$LOG_FILE"
+        sleep 3
+        log "  Cluster ready ($n nodes)"
+        return 0
     fi
+
     cd "$SCRIPT_DIR"
-    docker compose --profile 2-nodes --profile 3-nodes --profile 4-nodes \
-                   --profile 5-nodes --profile 6-nodes \
-                   down --remove-orphans 2>&1 | tail -3 | tee -a "$LOG_FILE"
-    docker compose --profile "${n}-nodes" up -d 2>&1 | tee -a "$LOG_FILE"
-    log "  Waiting for rpic_master..."
+
+    # ── Images exist but containers stopped/crashed ────────────────────────
+    # Test whether the existing image is actually executable (arm64 via QEMU).
+    # We do this by running a trivial command in a throwaway container.
+    if images_exist; then
+        log "  Images exist — testing if they are executable (arm64 check)..."
+        if docker run --rm --platform linux/arm64 pdc_project-master \
+               /bin/echo "arm64-ok" &>/dev/null; then
+            log "  Images are healthy — starting containers (no rebuild needed)"
+            docker compose \
+                --profile 2-nodes --profile 3-nodes --profile 4-nodes \
+                --profile 5-nodes --profile 6-nodes \
+                down --remove-orphans 2>&1 | tail -3 | tee -a "$LOG_FILE"
+            docker compose --profile "${n}-nodes" up -d \
+                2>&1 | tee -a "$LOG_FILE" \
+                || die "docker compose up failed"
+        else
+            log "  Images exist but are NOT executable (wrong platform) — rebuilding..."
+            docker compose \
+                --profile 2-nodes --profile 3-nodes --profile 4-nodes \
+                --profile 5-nodes --profile 6-nodes \
+                down --remove-orphans 2>&1 | tail -3 | tee -a "$LOG_FILE"
+            docker rmi pdc_project-master pdc_project-worker1 pdc_project-worker2 \
+                       pdc_project-worker3 pdc_project-worker4 pdc_project-worker5 \
+                       2>/dev/null || true
+            docker compose --profile "${n}-nodes" up -d --build \
+                2>&1 | tee -a "$LOG_FILE" \
+                || die "docker compose up --build failed"
+        fi
+    else
+        # ── No images at all — first run, must build ───────────────────────
+        log "  No images found — building from scratch (this takes ~5-10 min on first run)..."
+        docker compose --profile "${n}-nodes" up -d --build \
+            2>&1 | tee -a "$LOG_FILE" \
+            || die "docker compose up --build failed"
+    fi
+
+    log "  Waiting for rpic_master to become ready..."
     local retries=0
-    until master_running || [[ $retries -ge 30 ]]; do sleep 2; retries=$((retries+1)); done
-    master_running || die "rpic_master did not start after 60 s"
+    until master_healthy || [[ $retries -ge 40 ]]; do
+        sleep 3
+        retries=$((retries + 1))
+        log "  ... waiting ($((retries * 3))s)"
+    done
+
+    master_healthy || die "rpic_master did not become healthy after $((40 * 3))s. \
+Run: docker logs rpic_master"
+
     sleep 3
     log "  Cluster ready ($n nodes)"
 }
@@ -119,6 +200,7 @@ hostlist_for() {
 section "STEP 1: Starting cluster (${MAX_NODES} nodes)"
 cd "$SCRIPT_DIR"
 ensure_cluster
+
 log "Verifying MPI connectivity..."
 docker exec -u pi rpic_master \
     mpirun --allow-run-as-root -n "$MAX_NODES" \
@@ -136,7 +218,6 @@ if docker exec -u pi rpic_master test -d "$BSDS_DIR" 2>/dev/null && \
     log "  BSDS500 found at $BSDS_DIR"
     BSDS_OK=1
 elif docker exec -u pi rpic_master test -d "/home/pi/workspace/vision/datasets/BSDS500/images" 2>/dev/null; then
-    # Dataset exists but in a different split layout — just use what's there
     log "  BSDS500 found but 'test' split missing — checking for any images..."
     FIRST=$(docker exec -u pi rpic_master bash -c \
         "find /home/pi/workspace/vision/datasets/BSDS500/images -name '*.jpg' | head -1")
@@ -167,7 +248,7 @@ else:
     || die "BSDS500 download failed — cannot continue without dataset"
 fi
 
-# Build image list (host-side so we can count it)
+# Build image list
 mkdir -p "$WS/results"
 BSDS_LIST_HOST="$WS/results/bsds_img_list.txt"
 BSDS_LIST_CONT="/home/pi/workspace/results/bsds_img_list.txt"
@@ -179,10 +260,10 @@ ACTUAL_N=$(wc -l < "$BSDS_LIST_HOST")
 [[ $ACTUAL_N -eq 0 ]] && die "BSDS image list is empty"
 log "  Image list: $ACTUAL_N images → $BSDS_LIST_HOST"
 
-# Container-side output directories (all inside results/bsds_out → mounted to OUT_DIR)
+# Container-side output directories
 BSDS_OUT_CONT="/home/pi/workspace/results/bsds_out"
 for sub in sobel_arch1 sobel_arch2 sobel_arch3 sobel_arch4 \
-           canny_arch4 \
+           canny_arch1 canny_arch2 canny_arch3 canny_arch4 \
            log_arch1  log_arch2  log_arch3  log_arch4  \
            fft_arch1  fft_arch2  fft_arch3  fft_arch4; do
     docker exec -u pi rpic_master mkdir -p "$BSDS_OUT_CONT/$sub" 2>/dev/null || true
@@ -201,7 +282,6 @@ compile_binary() {
 }
 
 # ── Run helper ─────────────────────────────────────────────────────────────────
-# runc <nodes> <binary_rel_to_workspace> <args...>
 runc() {
     local nodes="$1" bin="$2"; shift 2
     local args="${*:-}"
@@ -236,6 +316,7 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
     compile_binary "vision/fft_arch2_pipeline"      "$BUILD/fft_arch2"
     compile_binary "vision/fft_arch3_dist_dynamic"  "$BUILD/fft_arch3"
     compile_binary "vision/fft_arch4_dist_pipeline" "$BUILD/fft_arch4"
+    compile_binary "vision/resilience_test"         "$BUILD/resilience_test"
     log "All binaries compiled into workspace/$BUILD/"
 else
     log "Skipping build (--skip-build)"
@@ -243,7 +324,6 @@ fi
 
 # =============================================================================
 #  STEP 4 — Serial baselines on every BSDS image
-#  Log lines:  IMAGE: <path>  then the usual baseline timing lines
 # =============================================================================
 section "STEP 4: Serial Baselines (BSDS500)"
 
@@ -254,15 +334,8 @@ done < "$BSDS_LIST_HOST"
 
 # =============================================================================
 #  STEP 5-8 — All four architectures, all four filters
-#
-#  Per-image runs  (arch1, arch2, arch3, arch4 single-image mode):
-#    logged as:  IMAGE: <path>  then arch timing lines
-#
-#  Arch4 / Canny batch run uses the image-list file
 # =============================================================================
 
-# Helper: run all four archs for one filter across the BSDS image list
-# run_filter_bsds <TAG> <b1> <b2> <b3> <b4>
 run_filter_bsds() {
     local tag="$1" b1="$2" b2="$3" b3="$4" b4="$5"
 
@@ -303,7 +376,6 @@ run_filter_bsds sobel "$BUILD/sobel_arch1" "$BUILD/sobel_arch2" \
                       "$BUILD/sobel_arch3" "$BUILD/sobel_arch4"
 
 section "STEP 6: Canny — All Architectures (BSDS500)"
-# Arch1/2/3 per-image; Arch4 is batch-ONLY
 while IFS= read -r img; do
     log "IMAGE: $img"
     stem=$(basename "$img" | sed 's/\.[^.]*$//')
@@ -327,7 +399,6 @@ run_filter_bsds log "$BUILD/log_arch1" "$BUILD/log_arch2" \
                     "$BUILD/log_arch3" "$BUILD/log_arch4"
 
 section "STEP 8: FFT — All Architectures (BSDS500)"
-# FFT binaries write to fixed filenames; only timing is captured
 while IFS= read -r img; do
     log "IMAGE: $img"
 
@@ -342,8 +413,7 @@ while IFS= read -r img; do
 done < "$BSDS_LIST_HOST"
 
 # =============================================================================
-#  STEP 9 — Resilience tests (Test 2 safe always; Tests 1/3/4 in isolation)
-#  Each test runs on a single representative BSDS image (first in list).
+#  STEP 9 — Resilience tests
 # =============================================================================
 section "STEP 9: Resilience Tests"
 
@@ -354,7 +424,6 @@ RES_CONT="/home/pi/workspace/results/resilience"
 docker exec -u pi rpic_master mkdir -p "$RES_CONT" 2>/dev/null || true
 mkdir -p "$WS/results/resilience"
 
-# Use the first BSDS image as the representative test image
 RESILIENCE_IMG=$(head -1 "$BSDS_LIST_HOST")
 if [[ -z "$RESILIENCE_IMG" ]]; then
     log "  [WARN] No BSDS image available for resilience tests — skipping"
@@ -362,22 +431,18 @@ else
     log "  Resilience image: $RESILIENCE_IMG"
     log "RESILIENCE_IMAGE: $RESILIENCE_IMG"
 
-    # Test 2 — Slow Node (safe, no ranks exit — always run)
     log "  [Resilience] Test 2: Slow Node"
     runc "$RESILIENCE_NODES" "$BUILD/resilience_test" \
         "$RESILIENCE_IMG $RES_CONT --test 2"
 
-    # Test 1 — Worker Crash (rank exits — isolated mpirun)
     log "  [Resilience] Test 1: Worker Crash"
     runc "$RESILIENCE_NODES" "$BUILD/resilience_test" \
         "$RESILIENCE_IMG $RES_CONT --test 1" || true
 
-    # Test 3 — Coordinator Recovery (rank 0 exits — isolated mpirun)
     log "  [Resilience] Test 3: Coordinator Recovery"
     runc "$RESILIENCE_NODES" "$BUILD/resilience_test" \
         "$RESILIENCE_IMG $RES_CONT --test 3" || true
 
-    # Test 4 — Partial Result (rank exits mid-send — isolated mpirun)
     log "  [Resilience] Test 4: Partial Result"
     runc "$RESILIENCE_NODES" "$BUILD/resilience_test" \
         "$RESILIENCE_IMG $RES_CONT --test 4" || true
@@ -385,7 +450,6 @@ fi
 
 # =============================================================================
 #  STEP 10 — Bully Election tests
-#  Runs election on full cluster, then with one failed node, then two.
 # =============================================================================
 section "STEP 10: Bully Election Tests"
 
@@ -393,15 +457,12 @@ compile_binary "vision/bully_election" "$BUILD/bully_election"
 
 log "BULLY_ELECTION_START"
 
-# Normal election — no failures
 log "  [Bully] Normal election (${MAX_NODES} nodes, no failures)"
 runc "$MAX_NODES" "$BUILD/bully_election" || true
 
-# Election with highest rank failed
 log "  [Bully] Election with rank $((MAX_NODES-1)) failed"
 runc "$MAX_NODES" "$BUILD/bully_election" "--fail $((MAX_NODES-1))" || true
 
-# Election with top-2 ranks failed (only if ≥4 nodes)
 if [[ $MAX_NODES -ge 4 ]]; then
     log "  [Bully] Election with ranks $((MAX_NODES-1)),$((MAX_NODES-2)) failed"
     runc "$MAX_NODES" "$BUILD/bully_election" \
@@ -432,13 +493,13 @@ fi
 section "STEP 12: Generating BSDS500 Report"
 if command -v python3 &>/dev/null; then
     python3 "$SCRIPT_DIR/generate_report_bsds.py" \
-        --log           "$LOG_FILE" \
-        --outdir        "$OUT_DIR" \
-        --recon-dir     "$OUT_DIR/reconstructed" \
+        --log            "$LOG_FILE" \
+        --outdir         "$OUT_DIR" \
+        --recon-dir      "$OUT_DIR/reconstructed" \
         --resilience-dir "$OUT_DIR/resilience" \
-        --gt-dir        "$WS/vision/datasets/BSDS500/groundTruth/test" \
-        --node-counts   "${NODE_COUNTS[*]}" \
-        --thread-counts "${THREAD_COUNTS[*]}" \
+        --gt-dir         "$WS/vision/datasets/BSDS500/groundTruth/test" \
+        --node-counts    "${NODE_COUNTS[*]}" \
+        --thread-counts  "${THREAD_COUNTS[*]}" \
         2>&1 | tee -a "$LOG_FILE"
 else
     log "[WARN] python3 not found — run generate_report_bsds.py manually"
