@@ -3,7 +3,6 @@ services:
     build: { context: ., dockerfile: Dockerfile.cluster }
     container_name: rpic_master
     hostname: master
-    platform: linux/arm64
     mem_limit: 1g
     cpus: 2.0
     ports: ["2222:22"]
@@ -14,7 +13,6 @@ services:
     build: { context: ., dockerfile: Dockerfile.cluster }
     container_name: rpic_worker1
     hostname: worker1
-    platform: linux/arm64
     mem_limit: 1g
     cpus: 2.0
     ports: ["2223:22"]
@@ -26,7 +24,6 @@ services:
     build: { context: ., dockerfile: Dockerfile.cluster }
     container_name: rpic_worker2
     hostname: worker2
-    platform: linux/arm64
     mem_limit: 1g
     cpus: 2.0
     ports: ["2224:22"]
@@ -38,7 +35,6 @@ services:
     build: { context: ., dockerfile: Dockerfile.cluster }
     container_name: rpic_worker3
     hostname: worker3
-    platform: linux/arm64
     mem_limit: 1g
     cpus: 2.0
     ports: ["2225:22"]
@@ -50,7 +46,6 @@ services:
     build: { context: ., dockerfile: Dockerfile.cluster }
     container_name: rpic_worker4
     hostname: worker4
-    platform: linux/arm64
     mem_limit: 1g
     cpus: 2.0
     ports: ["2226:22"]
@@ -62,7 +57,6 @@ services:
     build: { context: ., dockerfile: Dockerfile.cluster }
     container_name: rpic_worker5
     hostname: worker5
-    platform: linux/arm64
     mem_limit: 1g
     cpus: 2.0
     ports: ["2227:22"]
