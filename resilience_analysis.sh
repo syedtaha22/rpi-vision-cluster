@@ -12,9 +12,10 @@
 #  Usage:
 #    ./resilience_analysis.sh                        # defaults
 #    ./resilience_analysis.sh --quick               # single image, fewer tests
+#    ./resilience_analysis.sh --fix                 # wipe + redownload datasets, then run
 #    ./resilience_analysis.sh --skip-build
 #    ./resilience_analysis.sh --nodes 4             # min 3 required
-#    ./resilience_analysis.sh --image /path/img.png # custom test image
+#    ./resilience_analysis.sh --image /path/img.png # skip dataset check, use this image
 #    ./resilience_analysis.sh --timeout 120         # per-test timeout
 # =============================================================================
 
@@ -24,10 +25,17 @@ set -uo pipefail
 RESILIENCE_NODES=6      # must be ≥ 3
 SKIP_BUILD=0
 QUICK=0
+FIX=0               # --fix: wipe + redownload datasets
 CUSTOM_IMAGE=""
 TIMEOUT_SECS=120
 
-BSDS_DIR="/home/pi/workspace/vision/datasets/BSDS500/data/images/test"
+# Container workspace root (fixed by docker-compose bind-mount)
+CONT_WS="/home/pi/workspace"
+DS_ROOT="$CONT_WS/vision/datasets"
+
+# Resolved dynamically in Step 2
+BSDS_DIR=""
+COCO_IMG=""  
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -36,6 +44,7 @@ while [[ $# -gt 0 ]]; do
         --image)      CUSTOM_IMAGE="$2";       shift 2 ;;
         --skip-build) SKIP_BUILD=1;            shift   ;;
         --quick)      QUICK=1;                 shift   ;;
+        --fix)        FIX=1;                   shift   ;;
         --timeout)    TIMEOUT_SECS="$2";       shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -199,7 +208,7 @@ compile_binary() {
     docker exec -u pi rpic_master bash -c \
         "cd /home/pi/workspace && \
          mkdir -p \$(dirname $out_name) && \
-         mpic++ -std=c++17 -O2 -fopenmp ${src_stem}.cpp -o ${out_name} -lm" \
+         mpic++ -std=c++17 -O2 -fopenmp -I./vision/shared ${src_stem}.cpp -o ${out_name} -lm" \
         2>&1 | tee -a "$LOG_FILE" \
     || log "  [WARN] Compile failed for $src_stem"
 }
@@ -218,33 +227,95 @@ docker exec -u pi rpic_master \
     || log "[WARN] Cluster verification failed — continuing anyway"
 
 # ── Step 2: Select test image ─────────────────────────────────────────────────
-section "STEP 2: Selecting test image"
+section "STEP 2: Dataset management + test image selection (--fix=$FIX)"
 RES_IMG=""
 
 if [[ -n "$CUSTOM_IMAGE" ]]; then
-    if docker exec -u pi rpic_master test -f "$CUSTOM_IMAGE" 2>/dev/null; then
-        RES_IMG="$CUSTOM_IMAGE"
-        log "  Using custom image: $RES_IMG"
-    else
-        die "Custom image not found in container: $CUSTOM_IMAGE"
-    fi
+    docker exec -u pi rpic_master test -f "$CUSTOM_IMAGE" 2>/dev/null \
+        || die "Custom image not found in container: $CUSTOM_IMAGE"
+    RES_IMG="$CUSTOM_IMAGE"
+    log "  Using custom image: $RES_IMG"
 else
-    # Try BSDS500 first (larger, more representative)
-    BSDS_FIRST=$(docker exec -u pi rpic_master bash -c \
-        "find '$BSDS_DIR' -name '*.jpg' 2>/dev/null | sort | head -1" 2>/dev/null || true)
-    if [[ -n "$BSDS_FIRST" ]]; then
-        RES_IMG="$BSDS_FIRST"
-        log "  Using BSDS500 image: $RES_IMG"
+    # ── Ensure BSDS500 (primary) ──────────────────────────────────────────────
+    if [[ $FIX -eq 1 ]]; then
+        log "  [FIX] Removing BSDS500 for redownload..."
+        docker exec -u pi rpic_master rm -rf "$DS_ROOT/BSDS500" 2>/dev/null || true
+    fi
+
+    BSDS_DIR="$DS_ROOT/BSDS500/data/images/test"
+    BSDS_OK=0
+    if docker exec -u pi rpic_master test -d "$BSDS_DIR" 2>/dev/null && \
+       [[ $(docker exec -u pi rpic_master bash -c \
+           "find '$BSDS_DIR' -name '*.jpg' 2>/dev/null | wc -l") -gt 0 ]]; then
+        log "  BSDS500 found at $BSDS_DIR"
+        BSDS_OK=1
     else
-        # Fall back to COCO
-        COCO_IMG="/home/pi/workspace/vision/datasets/coco-val2017/000000144003.jpg"
-        if docker exec -u pi rpic_master test -f "$COCO_IMG" 2>/dev/null; then
-            RES_IMG="$COCO_IMG"
-            log "  Using COCO image: $RES_IMG"
-        else
-            die "No suitable test image found. Use --image to specify one."
+        # Search anywhere under BSDS500
+        FIRST=$(docker exec -u pi rpic_master bash -c \
+            "find '$DS_ROOT/BSDS500' -name '*.jpg' 2>/dev/null | sort | head -1" \
+            2>/dev/null || true)
+        if [[ -n "$FIRST" ]]; then
+            BSDS_DIR=$(docker exec -u pi rpic_master dirname "$FIRST")
+            log "  BSDS500 images found at: $BSDS_DIR"
+            BSDS_OK=1
         fi
     fi
+
+    if [[ $BSDS_OK -eq 0 ]]; then
+        log "  BSDS500 not found — downloading via kagglehub..."
+        docker exec -u pi rpic_master bash -c "
+pip install -q kagglehub scipy 2>/dev/null || true
+python3 -c "
+import kagglehub, shutil, os
+path = kagglehub.dataset_download('balraj98/berkeley-segmentation-dataset-500-bsds500')
+dst = '$DS_ROOT/BSDS500'
+if os.path.exists(dst): shutil.rmtree(dst)
+shutil.copytree(path, dst)
+print('BSDS500 ready at', dst)
+"" 2>&1 | tee -a "$LOG_FILE" && BSDS_OK=1 || true
+        if [[ $BSDS_OK -eq 1 ]]; then
+            FIRST=$(docker exec -u pi rpic_master bash -c \
+                "find '$DS_ROOT/BSDS500' -name '*.jpg' 2>/dev/null | sort | head -1" \
+                2>/dev/null || true)
+            [[ -n "$FIRST" ]] && BSDS_DIR=$(docker exec -u pi rpic_master dirname "$FIRST")
+        fi
+    fi
+
+    if [[ $BSDS_OK -eq 1 ]]; then
+        RES_IMG=$(docker exec -u pi rpic_master bash -c \
+            "find '$BSDS_DIR' -name '*.jpg' 2>/dev/null | sort | head -1" \
+            2>/dev/null || true)
+        [[ -n "$RES_IMG" ]] && log "  Using BSDS500 image: $RES_IMG"
+    fi
+
+    # ── COCO fallback ─────────────────────────────────────────────────────────
+    if [[ -z "$RES_IMG" ]]; then
+        log "  BSDS500 unavailable — trying COCO fallback..."
+        if [[ $FIX -eq 1 ]]; then
+            docker exec -u pi rpic_master rm -rf "$DS_ROOT/coco-val2017" 2>/dev/null || true
+        fi
+        COCO_COUNT=$(docker exec -u pi rpic_master bash -c \
+            "find '$DS_ROOT/coco-val2017' -name '*.jpg' 2>/dev/null | wc -l" \
+            2>/dev/null || echo 0)
+        if [[ $COCO_COUNT -eq 0 ]]; then
+            log "  Downloading COCO Val2017..."
+            docker exec -u pi rpic_master bash -c "
+mkdir -p $DS_ROOT && cd $DS_ROOT
+wget -q -nc --show-progress http://images.cocodataset.org/zips/val2017.zip 2>&1 || true
+unzip -q val2017.zip 2>/dev/null || true
+mv val2017 coco-val2017 2>/dev/null || true
+rm -f val2017.zip 2>/dev/null || true" 2>&1 | tee -a "$LOG_FILE" || true
+        fi
+        COCO_IMG=$(docker exec -u pi rpic_master bash -c \
+            "find '$DS_ROOT/coco-val2017' -name '*.jpg' 2>/dev/null | sort | head -1" \
+            2>/dev/null || true)
+        if [[ -n "$COCO_IMG" ]]; then
+            RES_IMG="$COCO_IMG"
+            log "  Using COCO image: $RES_IMG"
+        fi
+    fi
+
+    [[ -z "$RES_IMG" ]] && die "No test image available. Use --fix to redownload datasets or --image to specify one."
 fi
 
 log "RESILIENCE_IMAGE: $RES_IMG"
@@ -252,10 +323,10 @@ log "RESILIENCE_IMAGE: $RES_IMG"
 # ── Step 3: Build ─────────────────────────────────────────────────────────────
 if [[ $SKIP_BUILD -eq 0 ]]; then
     section "STEP 3: Building resilience and bully election binaries"
-    compile_binary "vision/resilience_test"  "$BUILD/resilience_test"
-    compile_binary "vision/bully_election"   "$BUILD/bully_election"
+    compile_binary "vision/resilience/resilience_test"  "$BUILD/resilience_test"
+    compile_binary "vision/resilience/bully_election"   "$BUILD/bully_election"
     # Also build a baseline for the reference checksum
-    compile_binary "vision/baselines"        "$BUILD/baselines"
+    compile_binary "vision/shared/baselines"        "$BUILD/baselines"
     log "Binaries compiled"
 else
     log "Skipping build (--skip-build)"

@@ -6,7 +6,7 @@ CXXFLAGS := -std=c++17 -O2 -I./include
 LDFLAGS  := -lm
 
 MPICXX      := mpic++
-MPICXXFLAGS := -std=c++17 -O2
+MPICXXFLAGS := -std=c++17 -O2 -I./vision/shared
 
 # ── Directories ───────────────────────────────────────────────────────────────
 BUILD_DIR := build
@@ -66,34 +66,36 @@ detector: $(TEST_BIN)
 
 # ── Parallel architecture binaries ───────────────────────────────────────────
 # These require mpic++ and are built inside the cluster container.
-# Run from the repo root: make compile FILE=vision/sobel_arch1_farm.cpp OUTPUT=sobel_arch1
+# Run from the repo root: make compile FILE=vision/sobel/sobel_arch1_farm.cpp OUTPUT=sobel_arch1
 #
 # Or build all at once (must be inside the container shell):
 vision:
 	@mkdir -p $(BUILD_DIR)
 	# ── Arch1: OpenMP Farm ─────────────────────────────────────────────────
-	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/sobel_arch1_farm.cpp      -o $(BUILD_DIR)/sobel_arch1 -lm
-	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/log_arch1_farm.cpp        -o $(BUILD_DIR)/log_arch1   -lm
-	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/canny_arch1_farm.cpp      -o $(BUILD_DIR)/canny_arch1 -lm
-	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/fft_arch1_farm.cpp        -o $(BUILD_DIR)/fft_arch1   -lm
+	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/sobel/sobel_arch1_farm.cpp      -o $(BUILD_DIR)/sobel_arch1 -lm
+	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/log/log_arch1_farm.cpp          -o $(BUILD_DIR)/log_arch1   -lm
+	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/canny/canny_arch1_farm.cpp      -o $(BUILD_DIR)/canny_arch1 -lm
+	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/fft/fft_arch1_farm.cpp          -o $(BUILD_DIR)/fft_arch1   -lm
 	# ── Arch2: OpenMP Pipeline ─────────────────────────────────────────────
-	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/sobel_arch2_pipeline.cpp  -o $(BUILD_DIR)/sobel_arch2 -lm
-	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/log_arch2_pipeline.cpp    -o $(BUILD_DIR)/log_arch2   -lm
-	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/canny_arch2_pipeline.cpp  -o $(BUILD_DIR)/canny_arch2 -lm
-	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/fft_arch2_pipeline.cpp    -o $(BUILD_DIR)/fft_arch2   -lm
+	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/sobel/sobel_arch2_pipeline.cpp  -o $(BUILD_DIR)/sobel_arch2 -lm
+	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/log/log_arch2_pipeline.cpp      -o $(BUILD_DIR)/log_arch2   -lm
+	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/canny/canny_arch2_pipeline.cpp  -o $(BUILD_DIR)/canny_arch2 -lm
+	$(MPICXX) $(MPICXXFLAGS) -fopenmp $(VISION)/fft/fft_arch2_pipeline.cpp      -o $(BUILD_DIR)/fft_arch2   -lm
 	# ── Arch3: MPI Scatter-Gather ──────────────────────────────────────────
-	$(MPICXX) $(MPICXXFLAGS) $(VISION)/sobel_arch3_scatter.cpp            -o $(BUILD_DIR)/sobel_arch3 -lm
-	$(MPICXX) $(MPICXXFLAGS) $(VISION)/log_arch3_scatter.cpp              -o $(BUILD_DIR)/log_arch3   -lm
-	$(MPICXX) $(MPICXXFLAGS) $(VISION)/canny_arch3_scatter.cpp            -o $(BUILD_DIR)/canny_arch3 -lm
-	$(MPICXX) $(MPICXXFLAGS) $(VISION)/fft_arch3_dist_dynamic.cpp         -o $(BUILD_DIR)/fft_arch3   -lm
+	$(MPICXX) $(MPICXXFLAGS) $(VISION)/sobel/sobel_arch3_scatter.cpp            -o $(BUILD_DIR)/sobel_arch3 -lm
+	$(MPICXX) $(MPICXXFLAGS) $(VISION)/log/log_arch3_scatter.cpp                -o $(BUILD_DIR)/log_arch3   -lm
+	$(MPICXX) $(MPICXXFLAGS) $(VISION)/canny/canny_arch3_scatter.cpp            -o $(BUILD_DIR)/canny_arch3 -lm
+	$(MPICXX) $(MPICXXFLAGS) $(VISION)/fft/fft_arch3_dist_dynamic.cpp           -o $(BUILD_DIR)/fft_arch3   -lm
 	# ── Arch4: MPI Distributed Pipeline ───────────────────────────────────
-	$(MPICXX) $(MPICXXFLAGS) $(VISION)/sobel_arch4_pipeline.cpp           -o $(BUILD_DIR)/sobel_arch4 -lm
-	$(MPICXX) $(MPICXXFLAGS) $(VISION)/log_arch4_pipeline.cpp             -o $(BUILD_DIR)/log_arch4   -lm
-	$(MPICXX) $(MPICXXFLAGS) $(VISION)/canny_arch4_pipeline.cpp           -o $(BUILD_DIR)/canny_arch4 -lm
-	$(MPICXX) $(MPICXXFLAGS) $(VISION)/fft_arch4_dist_pipeline.cpp        -o $(BUILD_DIR)/fft_arch4   -lm
+	$(MPICXX) $(MPICXXFLAGS) $(VISION)/sobel/sobel_arch4_pipeline.cpp           -o $(BUILD_DIR)/sobel_arch4 -lm
+	$(MPICXX) $(MPICXXFLAGS) $(VISION)/log/log_arch4_pipeline.cpp               -o $(BUILD_DIR)/log_arch4   -lm
+	$(MPICXX) $(MPICXXFLAGS) $(VISION)/canny/canny_arch4_pipeline.cpp           -o $(BUILD_DIR)/canny_arch4 -lm
+	$(MPICXX) $(MPICXXFLAGS) $(VISION)/fft/fft_arch4_dist_pipeline.cpp          -o $(BUILD_DIR)/fft_arch4   -lm
 	# ── Extras: Bully Election + Resilience ───────────────────────────────
-	$(MPICXX) $(MPICXXFLAGS) $(VISION)/bully_election.cpp                 -o $(BUILD_DIR)/bully_election   -lm
-	$(MPICXX) $(MPICXXFLAGS) $(VISION)/resilience_test.cpp                -o $(BUILD_DIR)/resilience_test  -lm
+	$(MPICXX) $(MPICXXFLAGS) $(VISION)/resilience/bully_election.cpp            -o $(BUILD_DIR)/bully_election   -lm
+	$(MPICXX) $(MPICXXFLAGS) $(VISION)/resilience/resilience_test.cpp           -o $(BUILD_DIR)/resilience_test  -lm
+	# ── Shared: Baselines ─────────────────────────────────────────────────
+	$(MPICXX) $(MPICXXFLAGS) $(VISION)/shared/baselines.cpp                     -o $(BUILD_DIR)/baselines        -lm
 	@echo "All architecture binaries built in ./build/"
 
 # ── Clean ─────────────────────────────────────────────────────────────────────

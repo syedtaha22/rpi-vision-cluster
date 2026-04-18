@@ -10,9 +10,10 @@
 #  Usage:
 #    ./run_analysis.sh                          # full run, defaults
 #    ./run_analysis.sh --quick                  # 1 image, fewer configs
+#    ./run_analysis.sh --fix                    # wipe + redownload datasets, then run
 #    ./run_analysis.sh --skip-build             # skip recompiling binaries
 #    ./run_analysis.sh --nodes 2,4 --threads 1,4
-#    ./run_analysis.sh --image /path/to/img.png
+#    ./run_analysis.sh --image /path/to/img.png # skip dataset check, use this image
 #    ./run_analysis.sh --timeout 90             # per-run timeout (seconds)
 # =============================================================================
 
@@ -39,6 +40,7 @@ while [[ $# -gt 0 ]]; do
         --image)      CUSTOM_IMAGE="$2";                       shift 2 ;;
         --skip-build) SKIP_BUILD=1;                            shift   ;;
         --quick)      QUICK=1;                                 shift   ;;
+        --fix)        FIX=1;                                   shift   ;;
         --timeout)    TIMEOUT_SECS="$2";                       shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -49,11 +51,9 @@ if [[ $QUICK -eq 1 ]]; then
     THREAD_COUNTS=(1 2)
 fi
 
-if [[ -n "$CUSTOM_IMAGE" ]]; then
-    IMAGES=("$CUSTOM_IMAGE")
-else
-    IMAGES=("$CIFAR_IMG" "$TINY_IMG" "$COCO_IMG")
-fi
+# IMAGES array is built in Step 2 after dataset verification
+# (unless --image was given, in which case we skip dataset management)
+IMAGES=()
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -216,7 +216,7 @@ compile_binary() {
     docker exec -u pi rpic_master bash -c \
         "cd /home/pi/workspace && \
          mkdir -p \$(dirname $out_name) && \
-         mpic++ -std=c++17 -O2 -fopenmp ${src_stem}.cpp -o ${out_name} -lm" \
+         mpic++ -std=c++17 -O2 -fopenmp -I./vision/shared ${src_stem}.cpp -o ${out_name} -lm" \
         2>&1 | tee -a "$LOG_FILE" \
     || log "  [WARN] Compile failed for $src_stem"
 }
@@ -234,35 +234,133 @@ docker exec -u pi rpic_master \
     && log "Cluster verification: OK" \
     || log "[WARN] Cluster verification failed — continuing anyway"
 
-# ── Step 2: Dataset check ─────────────────────────────────────────────────────
-section "STEP 2: Checking datasets"
-check_img() {
-    docker exec -u pi rpic_master test -f "$1" 2>/dev/null \
-        && log "  OK   $1" \
-        || log "  MISSING  $1  (runs with this image will be skipped)"
+# ── Step 2: Dataset management ───────────────────────────────────────────────
+section "STEP 2: Dataset management (--fix=$FIX)"
+
+# ensure_dataset <label> <dir_in_container> <find_pattern> <var_name>
+# Downloads dataset if absent (or wipes + redownloads if FIX=1).
+# Sets the named variable to the first discovered image path.
+ensure_dataset() {
+    local label="$1" ds_dir="$2" pattern="$3" retvar="$4"
+    if [[ $FIX -eq 1 ]]; then
+        log "  [FIX] Removing $label for redownload..."
+        docker exec -u pi rpic_master rm -rf "$ds_dir" 2>/dev/null || true
+    fi
+    local count
+    count=$(docker exec -u pi rpic_master bash -c \
+        "find '$ds_dir' -name '$pattern' 2>/dev/null | wc -l" 2>/dev/null || echo 0)
+    if [[ $count -gt 0 ]]; then
+        log "  [OK] $label already present ($count images)"
+    else
+        log "  Downloading $label..."
+        case "$label" in
+          CIFAR-10)
+            docker exec -u pi rpic_master bash -c "
+pip install -q Pillow numpy 2>/dev/null || true
+mkdir -p $ds_dir
+cd $DS_ROOT
+wget -q -nc --show-progress https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz 2>&1 || true
+tar -xzf cifar-10-python.tar.gz 2>/dev/null || true
+python3 -c "
+import pickle, numpy as np, os
+try:
+    from PIL import Image
+except ImportError:
+    import subprocess; subprocess.run(['pip','install','-q','Pillow'])
+    from PIL import Image
+src='$DS_ROOT/cifar-10-batches-py/data_batch_1'
+out='$ds_dir'
+os.makedirs(out, exist_ok=True)
+with open(src,'rb') as f:
+    d=pickle.load(f,encoding='bytes')
+data,names=d[b'data'],d[b'filenames']
+for i in range(min(100,len(data))):
+    r,g,b=data[i][:1024].reshape(32,32),data[i][1024:2048].reshape(32,32),data[i][2048:].reshape(32,32)
+    Image.fromarray(np.dstack((r,g,b))).save(os.path.join(out,names[i].decode()))
+print('CIFAR-10 extracted')
+"
+rm -rf $DS_ROOT/cifar-10-batches-py $DS_ROOT/cifar-10-python.tar.gz 2>/dev/null || true
+" 2>&1 | tee -a "$LOG_FILE" || log "  [WARN] CIFAR-10 download failed"
+            ;;
+          TinyImageNet)
+            docker exec -u pi rpic_master bash -c "
+mkdir -p $DS_ROOT
+cd $DS_ROOT
+wget -q -nc --show-progress http://cs231n.stanford.edu/tiny-imagenet-200.zip 2>&1 || true
+unzip -q tiny-imagenet-200.zip 2>/dev/null || true
+rm -f tiny-imagenet-200.zip 2>/dev/null || true
+" 2>&1 | tee -a "$LOG_FILE" || log "  [WARN] TinyImageNet download failed"
+            ;;
+          COCO-Val2017)
+            docker exec -u pi rpic_master bash -c "
+mkdir -p $DS_ROOT
+cd $DS_ROOT
+wget -q -nc --show-progress http://images.cocodataset.org/zips/val2017.zip 2>&1 || true
+unzip -q val2017.zip 2>/dev/null || true
+mv val2017 coco-val2017 2>/dev/null || true
+rm -f val2017.zip 2>/dev/null || true
+" 2>&1 | tee -a "$LOG_FILE" || log "  [WARN] COCO download failed"
+            ;;
+        esac
+    fi
+    # Discover first image dynamically
+    local img
+    img=$(docker exec -u pi rpic_master bash -c \
+        "find '$ds_dir' -name '$pattern' 2>/dev/null | sort | head -1" 2>/dev/null || true)
+    if [[ -z "$img" ]]; then
+        log "  [WARN] No $pattern found under $ds_dir — $label runs will be skipped"
+    else
+        log "  [IMG] $label -> $img"
+    fi
+    printf -v "$retvar" '%s' "$img"
 }
-for img in "${IMAGES[@]}"; do check_img "$img"; done
+
+if [[ -n "$CUSTOM_IMAGE" ]]; then
+    # --image provided: skip all dataset management
+    log "  Custom image specified — skipping dataset management"
+    docker exec -u pi rpic_master test -f "$CUSTOM_IMAGE" 2>/dev/null \
+        || die "Custom image not found in container: $CUSTOM_IMAGE"
+    IMAGES=("$CUSTOM_IMAGE")
+else
+    ensure_dataset "CIFAR-10"     "$DS_ROOT/cifar-10"             "*.png"  CIFAR_IMG
+    ensure_dataset "TinyImageNet" "$DS_ROOT/tiny-imagenet-200"    "*.JPEG" TINY_IMG
+    # TinyImageNet fallback: also try .jpeg or .jpg
+    if [[ -z "$TINY_IMG" ]]; then
+        ensure_dataset "TinyImageNet" "$DS_ROOT/tiny-imagenet-200" "*.jpeg" TINY_IMG
+    fi
+    if [[ -z "$TINY_IMG" ]]; then
+        ensure_dataset "TinyImageNet" "$DS_ROOT/tiny-imagenet-200" "*.jpg"  TINY_IMG
+    fi
+    ensure_dataset "COCO-Val2017" "$DS_ROOT/coco-val2017"         "*.jpg"  COCO_IMG
+
+    # Build IMAGES array from whatever was found
+    for img in "$CIFAR_IMG" "$TINY_IMG" "$COCO_IMG"; do
+        [[ -n "$img" ]] && IMAGES+=("$img")
+    done
+    [[ ${#IMAGES[@]} -eq 0 ]] && die "No dataset images available — use --fix to redownload"
+    log "  Running on ${#IMAGES[@]} image(s): ${IMAGES[*]}"
+fi
 
 # ── Step 3: Build all binaries ────────────────────────────────────────────────
 if [[ $SKIP_BUILD -eq 0 ]]; then
     section "STEP 3: Building all architecture binaries"
-    compile_binary "vision/baselines"               "$BUILD/baselines"
-    compile_binary "vision/sobel_arch1_farm"        "$BUILD/sobel_arch1"
-    compile_binary "vision/sobel_arch2_pipeline"    "$BUILD/sobel_arch2"
-    compile_binary "vision/sobel_arch3_scatter"     "$BUILD/sobel_arch3"
-    compile_binary "vision/sobel_arch4_pipeline"    "$BUILD/sobel_arch4"
-    compile_binary "vision/canny_arch1_farm"        "$BUILD/canny_arch1"
-    compile_binary "vision/canny_arch2_pipeline"    "$BUILD/canny_arch2"
-    compile_binary "vision/canny_arch3_scatter"     "$BUILD/canny_arch3"
-    compile_binary "vision/canny_arch4_pipeline"    "$BUILD/canny_arch4"
-    compile_binary "vision/log_arch1_farm"          "$BUILD/log_arch1"
-    compile_binary "vision/log_arch2_pipeline"      "$BUILD/log_arch2"
-    compile_binary "vision/log_arch3_scatter"       "$BUILD/log_arch3"
-    compile_binary "vision/log_arch4_pipeline"      "$BUILD/log_arch4"
-    compile_binary "vision/fft_arch1_farm"          "$BUILD/fft_arch1"
-    compile_binary "vision/fft_arch2_pipeline"      "$BUILD/fft_arch2"
-    compile_binary "vision/fft_arch3_dist_dynamic"  "$BUILD/fft_arch3"
-    compile_binary "vision/fft_arch4_dist_pipeline" "$BUILD/fft_arch4"
+    compile_binary "vision/shared/baselines"               "$BUILD/baselines"
+    compile_binary "vision/sobel/sobel_arch1_farm"        "$BUILD/sobel_arch1"
+    compile_binary "vision/sobel/sobel_arch2_pipeline"    "$BUILD/sobel_arch2"
+    compile_binary "vision/sobel/sobel_arch3_scatter"     "$BUILD/sobel_arch3"
+    compile_binary "vision/sobel/sobel_arch4_pipeline"    "$BUILD/sobel_arch4"
+    compile_binary "vision/canny/canny_arch1_farm"        "$BUILD/canny_arch1"
+    compile_binary "vision/canny/canny_arch2_pipeline"    "$BUILD/canny_arch2"
+    compile_binary "vision/canny/canny_arch3_scatter"     "$BUILD/canny_arch3"
+    compile_binary "vision/canny/canny_arch4_pipeline"    "$BUILD/canny_arch4"
+    compile_binary "vision/log/log_arch1_farm"          "$BUILD/log_arch1"
+    compile_binary "vision/log/log_arch2_pipeline"      "$BUILD/log_arch2"
+    compile_binary "vision/log/log_arch3_scatter"       "$BUILD/log_arch3"
+    compile_binary "vision/log/log_arch4_pipeline"      "$BUILD/log_arch4"
+    compile_binary "vision/fft/fft_arch1_farm"          "$BUILD/fft_arch1"
+    compile_binary "vision/fft/fft_arch2_pipeline"      "$BUILD/fft_arch2"
+    compile_binary "vision/fft/fft_arch3_dist_dynamic"  "$BUILD/fft_arch3"
+    compile_binary "vision/fft/fft_arch4_dist_pipeline" "$BUILD/fft_arch4"
     log "All binaries compiled into workspace/$BUILD/"
 else
     log "Skipping build (--skip-build)"

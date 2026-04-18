@@ -1,4 +1,4 @@
-.PHONY: help setup start stop restart clean verify test logs shell destroy compile run
+.PHONY: help setup start stop restart clean clean-results verify test logs shell destroy compile run
 
 # Configuration
 NODES ?= 2
@@ -146,6 +146,16 @@ destroy:
 	@sleep 5
 	docker compose $(ALL_PROFILES) down -v --rmi all
 	@echo "Complete removal done"
+
+# Delete generated output files (reports, logs, result images)
+# Does NOT remove compiled binaries (workspace/build/) or datasets
+clean-results:
+	@echo "Removing generated reports, logs, and result images..."
+	rm -rf report/ report_bsds/ report_resilience/
+	rm -f analysis_results.log report_bsds/analysis_bsds.log report_resilience/analysis_resilience.log
+	@echo "Removing result images and lists from workspace/results/..."
+	rm -rf workspace/results/
+	@echo "Done — run any analysis script to regenerate"
 
 # Compile C/C++ in cluster (ARM64 with MPI)
 compile:

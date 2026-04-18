@@ -9,6 +9,7 @@
 #  Usage:
 #    ./run_analysis_bsds.sh                        # defaults (10 images)
 #    ./run_analysis_bsds.sh --quick                # 3 images, fewer configs
+#    ./run_analysis_bsds.sh --fix                  # wipe + redownload BSDS500, then run
 #    ./run_analysis_bsds.sh --skip-build
 #    ./run_analysis_bsds.sh --nodes 2,4 --threads 1,4
 #    ./run_analysis_bsds.sh --n-images 50
@@ -22,11 +23,17 @@ NODE_COUNTS=(2 4 6)
 THREAD_COUNTS=(1 2 4)
 SKIP_BUILD=0
 QUICK=0
+FIX=0               # --fix: wipe + redownload BSDS500 dataset
 BSDS_N=10
 TIMEOUT_SECS=180    # per-run guard — BSDS images are larger than CIFAR/Tiny
 
-BSDS_DIR="/home/pi/workspace/vision/datasets/BSDS500/data/images/test"
-BSDS_GT_DIR="/home/pi/workspace/vision/datasets/BSDS500/data/groundTruth/test"
+# Container workspace root (fixed by docker-compose bind-mount)
+CONT_WS="/home/pi/workspace"
+DS_ROOT="$CONT_WS/vision/datasets"
+
+# Resolved dynamically in Step 2
+BSDS_DIR=""
+BSDS_GT_DIR=
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -36,6 +43,7 @@ while [[ $# -gt 0 ]]; do
         --n-images)   BSDS_N="$2";                             shift 2 ;;
         --skip-build) SKIP_BUILD=1;                            shift   ;;
         --quick)      QUICK=1;                                 shift   ;;
+        --fix)        FIX=1;                                   shift   ;;
         --timeout)    TIMEOUT_SECS="$2";                       shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -209,7 +217,7 @@ compile_binary() {
     docker exec -u pi rpic_master bash -c \
         "cd /home/pi/workspace && \
          mkdir -p \$(dirname $out_name) && \
-         mpic++ -std=c++17 -O2 -fopenmp ${src_stem}.cpp -o ${out_name} -lm" \
+         mpic++ -std=c++17 -O2 -fopenmp -I./vision/shared ${src_stem}.cpp -o ${out_name} -lm" \
         2>&1 | tee -a "$LOG_FILE" \
     || log "  [WARN] Compile failed for $src_stem"
 }
@@ -228,55 +236,86 @@ docker exec -u pi rpic_master \
     || log "[WARN] Cluster verification failed — continuing anyway"
 
 # ── Step 2: BSDS500 dataset ───────────────────────────────────────────────────
-section "STEP 2: Checking / Downloading BSDS500"
+section "STEP 2: BSDS500 Dataset Management (--fix=$FIX)"
+
+# Wipe dataset if --fix requested
+if [[ $FIX -eq 1 ]]; then
+    log "  [FIX] Removing BSDS500 dataset for redownload..."
+    docker exec -u pi rpic_master rm -rf "$DS_ROOT/BSDS500" 2>/dev/null || true
+fi
+
+# ── Locate or download BSDS500 ────────────────────────────────────────────────
 BSDS_OK=0
 
-# Try primary path, then fall back to alternate layout
+# Check primary expected layout first
+BSDS_DIR="$DS_ROOT/BSDS500/data/images/test"
 if docker exec -u pi rpic_master test -d "$BSDS_DIR" 2>/dev/null && \
-   [[ $(docker exec -u pi rpic_master bash -c "ls '$BSDS_DIR'/*.jpg 2>/dev/null | wc -l") -gt 0 ]]; then
+   [[ $(docker exec -u pi rpic_master bash -c "find '$BSDS_DIR' -name '*.jpg' 2>/dev/null | wc -l") -gt 0 ]]; then
     log "  BSDS500 found at $BSDS_DIR"
     BSDS_OK=1
-elif docker exec -u pi rpic_master test -d "/home/pi/workspace/vision/datasets/BSDS500" 2>/dev/null; then
+else
+    # Search anywhere under DS_ROOT/BSDS500 for .jpg images
     FIRST=$(docker exec -u pi rpic_master bash -c \
-        "find /home/pi/workspace/vision/datasets/BSDS500 -name '*.jpg' | head -1")
+        "find '$DS_ROOT/BSDS500' -name '*.jpg' 2>/dev/null | sort | head -1" 2>/dev/null || true)
     if [[ -n "$FIRST" ]]; then
-        BSDS_DIR=$(dirname "$FIRST")
-        log "  Found images at: $BSDS_DIR"
+        BSDS_DIR=$(docker exec -u pi rpic_master dirname "$FIRST")
+        log "  BSDS500 images found at: $BSDS_DIR"
         BSDS_OK=1
     fi
 fi
 
 if [[ $BSDS_OK -eq 0 ]]; then
-    log "  BSDS500 not found — attempting download via kagglehub..."
-    docker exec -u pi rpic_master bash -c \
-        "pip install -q kagglehub && \
-         python3 -c \"\
+    log "  BSDS500 not found — downloading via kagglehub..."
+    docker exec -u pi rpic_master bash -c "
+pip install -q kagglehub scipy 2>/dev/null || true
+python3 -c "
 import kagglehub, shutil, os
-p = kagglehub.dataset_download('balraj98/berkeley-segmentation-dataset-500-bsds500')
-dst = '/home/pi/workspace/vision/datasets/BSDS500'
-if not os.path.exists(dst):
-    shutil.copytree(p, dst)
-    print('BSDS500 downloaded to', dst)
-else:
-    print('BSDS500 already at', dst)
-\"" 2>&1 | tee -a "$LOG_FILE" \
-    && BSDS_OK=1 \
-    || die "BSDS500 download failed — cannot continue"
+print('  Downloading BSDS500 from Kaggle...')
+path = kagglehub.dataset_download('balraj98/berkeley-segmentation-dataset-500-bsds500')
+print(f'  Downloaded to: {path}')
+dst = '$DS_ROOT/BSDS500'
+if os.path.exists(dst):
+    shutil.rmtree(dst)
+shutil.copytree(path, dst)
+print('  BSDS500 ready at', dst)
+"
+" 2>&1 | tee -a "$LOG_FILE" && BSDS_OK=1 || die "BSDS500 download failed — cannot continue"
+
+    # Rediscover after download
+    FIRST=$(docker exec -u pi rpic_master bash -c \
+        "find '$DS_ROOT/BSDS500' -name '*.jpg' 2>/dev/null | sort | head -1" 2>/dev/null || true)
+    if [[ -n "$FIRST" ]]; then
+        BSDS_DIR=$(docker exec -u pi rpic_master dirname "$FIRST")
+        log "  Images at: $BSDS_DIR"
+    else
+        die "BSDS500 download succeeded but no .jpg images found"
+    fi
 fi
 
-# Build image list
+# ── Derive BSDS_GT_DIR dynamically from wherever BSDS_DIR landed ──────────────
+# BSDS_DIR is e.g. .../BSDS500/data/images/test -> swap images -> groundTruth
+BSDS_GT_DIR="${BSDS_DIR/data\/images/data\/groundTruth}"
+# Fallback: search the tree for any groundTruth/test directory
+if ! docker exec -u pi rpic_master test -d "$BSDS_GT_DIR" 2>/dev/null; then
+    FOUND_GT=$(docker exec -u pi rpic_master bash -c \
+        "find '$DS_ROOT/BSDS500' -type d -name test | grep groundTruth | head -1" \
+        2>/dev/null || true)
+    [[ -n "$FOUND_GT" ]] && BSDS_GT_DIR="$FOUND_GT"
+fi
+
+# ── Build image list ───────────────────────────────────────────────────────────
 mkdir -p "$WS/results"
 BSDS_LIST_HOST="$WS/results/bsds_img_list.txt"
-BSDS_LIST_CONT="/home/pi/workspace/results/bsds_img_list.txt"
+BSDS_LIST_CONT="$CONT_WS/results/bsds_img_list.txt"
 
 docker exec -u pi rpic_master bash -c \
     "find '$BSDS_DIR' -name '*.jpg' | sort | head -${BSDS_N}" \
     > "$BSDS_LIST_HOST"
 ACTUAL_N=$(wc -l < "$BSDS_LIST_HOST")
 [[ $ACTUAL_N -eq 0 ]] && die "BSDS image list is empty"
-log "  Image list: $ACTUAL_N images → $BSDS_LIST_HOST"
+log "  Image list: $ACTUAL_N images -> $BSDS_LIST_HOST"
 
-# Check ground-truth directory
+# ── Ground-truth availability ──────────────────────────────────────────────────
 GT_AVAILABLE=0
 if docker exec -u pi rpic_master test -d "$BSDS_GT_DIR" 2>/dev/null; then
     GT_AVAILABLE=1
@@ -297,23 +336,23 @@ done
 # ── Step 3: Build ─────────────────────────────────────────────────────────────
 if [[ $SKIP_BUILD -eq 0 ]]; then
     section "STEP 3: Building all architecture binaries"
-    compile_binary "vision/baselines"               "$BUILD/baselines"
-    compile_binary "vision/sobel_arch1_farm"        "$BUILD/sobel_arch1"
-    compile_binary "vision/sobel_arch2_pipeline"    "$BUILD/sobel_arch2"
-    compile_binary "vision/sobel_arch3_scatter"     "$BUILD/sobel_arch3"
-    compile_binary "vision/sobel_arch4_pipeline"    "$BUILD/sobel_arch4"
-    compile_binary "vision/canny_arch1_farm"        "$BUILD/canny_arch1"
-    compile_binary "vision/canny_arch2_pipeline"    "$BUILD/canny_arch2"
-    compile_binary "vision/canny_arch3_scatter"     "$BUILD/canny_arch3"
-    compile_binary "vision/canny_arch4_pipeline"    "$BUILD/canny_arch4"
-    compile_binary "vision/log_arch1_farm"          "$BUILD/log_arch1"
-    compile_binary "vision/log_arch2_pipeline"      "$BUILD/log_arch2"
-    compile_binary "vision/log_arch3_scatter"       "$BUILD/log_arch3"
-    compile_binary "vision/log_arch4_pipeline"      "$BUILD/log_arch4"
-    compile_binary "vision/fft_arch1_farm"          "$BUILD/fft_arch1"
-    compile_binary "vision/fft_arch2_pipeline"      "$BUILD/fft_arch2"
-    compile_binary "vision/fft_arch3_dist_dynamic"  "$BUILD/fft_arch3"
-    compile_binary "vision/fft_arch4_dist_pipeline" "$BUILD/fft_arch4"
+    compile_binary "vision/shared/baselines"               "$BUILD/baselines"
+    compile_binary "vision/sobel/sobel_arch1_farm"        "$BUILD/sobel_arch1"
+    compile_binary "vision/sobel/sobel_arch2_pipeline"    "$BUILD/sobel_arch2"
+    compile_binary "vision/sobel/sobel_arch3_scatter"     "$BUILD/sobel_arch3"
+    compile_binary "vision/sobel/sobel_arch4_pipeline"    "$BUILD/sobel_arch4"
+    compile_binary "vision/canny/canny_arch1_farm"        "$BUILD/canny_arch1"
+    compile_binary "vision/canny/canny_arch2_pipeline"    "$BUILD/canny_arch2"
+    compile_binary "vision/canny/canny_arch3_scatter"     "$BUILD/canny_arch3"
+    compile_binary "vision/canny/canny_arch4_pipeline"    "$BUILD/canny_arch4"
+    compile_binary "vision/log/log_arch1_farm"          "$BUILD/log_arch1"
+    compile_binary "vision/log/log_arch2_pipeline"      "$BUILD/log_arch2"
+    compile_binary "vision/log/log_arch3_scatter"       "$BUILD/log_arch3"
+    compile_binary "vision/log/log_arch4_pipeline"      "$BUILD/log_arch4"
+    compile_binary "vision/fft/fft_arch1_farm"          "$BUILD/fft_arch1"
+    compile_binary "vision/fft/fft_arch2_pipeline"      "$BUILD/fft_arch2"
+    compile_binary "vision/fft/fft_arch3_dist_dynamic"  "$BUILD/fft_arch3"
+    compile_binary "vision/fft/fft_arch4_dist_pipeline" "$BUILD/fft_arch4"
     log "All binaries compiled into workspace/$BUILD/"
 else
     log "Skipping build (--skip-build)"
@@ -416,12 +455,18 @@ fi
 section "STEP 10: Generating BSDS500 Report"
 GT_ARG=""
 if [[ $GT_AVAILABLE -eq 1 ]]; then
-    # Export GT from container to host
     mkdir -p "$WS/results/gt"
+    # Derive the relative path under BSDS500/data/ for the tar command
+    BSDS500_DATA_ROOT=$(docker exec -u pi rpic_master bash -c \
+        "echo '$BSDS_GT_DIR' | sed 's|/data/.*||')/data" 2>/dev/null || \
+        echo "$DS_ROOT/BSDS500/data"
+    GT_REL=$(docker exec -u pi rpic_master bash -c \
+        "echo '$BSDS_GT_DIR' | sed 's|.*BSDS500/data/||'" 2>/dev/null || \
+        echo "groundTruth/test")
     docker exec -u pi rpic_master bash -c \
-        "cd /home/pi/workspace/vision/datasets/BSDS500/data && tar cf - groundTruth/test" \
+        "cd '$BSDS500_DATA_ROOT' && tar cf - '$GT_REL'" \
         | tar xf - -C "$WS/results/gt/" 2>/dev/null || true
-    GT_ARG="--gt-dir $WS/results/gt/groundTruth/test"
+    GT_ARG="--gt-dir $WS/results/gt/$GT_REL"
 fi
 
 if command -v python3 &>/dev/null; then

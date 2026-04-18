@@ -8,54 +8,53 @@ enabling development and testing on x86 machines.
 
 Milestone 2 extends the FFT parallel architectures from Milestone 1 with a full implementation
 of **Sobel**, **Canny**, and **LoG** edge detectors across four parallel architectures
-(OpenMP Farm, OpenMP Pipeline, MPI Scatter-Gather, MPI Pipeline), benchmarked on **BSD500**
-with Jaccard, Dice, and SSIM evaluation metrics. Full PRAM analysis (Amdahl, Brent, Isoefficiency)
-is provided for each filter/architecture combination.
+(OpenMP Farm, OpenMP Pipeline, MPI Scatter-Gather, MPI Pipeline), benchmarked on **BSDS500**
+with Jaccard, Dice, and SSIM evaluation metrics.
+
+---
 
 ## Project Structure
 
 ```
 rpi-vision-cluster/
-├── Makefile                        # Cluster management & compilation commands
-├── Dockerfile.cluster              # Container configuration with MPI, SSH, Python
-├── docker-compose.yml              # Scalable cluster definition (2-6 nodes)
-├── download_substantial_datasets.sh # Downloads CIFAR-10, Tiny ImageNet, COCO, BSD500
-├── run_analysis.sh                 # Automated benchmark suite
-├── generate_report.py              # Performance report generator
+├── Makefile                          # Cluster management, compilation, and cleanup
+├── Dockerfile.cluster                # Container image with MPI, SSH, Python
+├── docker-compose.yml                # Scalable cluster definition (2-6 nodes)
+├── download_substantial_datasets.sh  # Standalone convenience download script (optional)
+├── run_analysis.sh                   # Benchmark: CIFAR / Tiny ImageNet / COCO image sizes
+├── run_analysis_bsds.sh              # Benchmark: BSDS500 performance + quality metrics
+├── resilience_analysis.sh            # Benchmark: fault tolerance & bully election
+├── generate_report.py                # Performance report generator
+├── generate_report_bsds.py           # BSDS500 report generator
+└── generate_report_resilience.py     # Resilience report generator
+
+workspace/                            # Mounted into every container at /home/pi/workspace/
+├── hello_cluster.py                  # MPI connectivity test
+├── plot.ipynb                        # Benchmark result visualisation notebook
+├── run_bsds500_all.sh                # Full BSDS500 run (all filters x all archs)
 │
-└── workspace/                      # All files mounted in cluster containers
-    ├── hello_cluster.py            # MPI test script
-    ├── plot.ipynb                  # Benchmark result visualisation notebook
-    │
-    ├── include/                    # Milestone 2: shared C++ headers
-    │   ├── sobel.hpp               # SobelDetector class interface
-    │   ├── canny.hpp               # CannyDetector class interface
-    │   ├── image_io.hpp            # ImageIO + Image RAII wrapper (stb_image)
-    │   ├── timing.hpp              # Timer class (chrono + MPI_Barrier sync)
-    │   ├── utils.hpp               # ArgParser utility
-    │   ├── stb_image.h             # Single-header image loader
-    │   └── stb_image_write.h       # Single-header image writer
-    │
-    ├── src/                        # Milestone 2: detector implementations
-    │   ├── sobel.cpp               # Sobel gradient computation (uint8 + float paths)
-    │   └── canny.cpp               # Canny pipeline: Gaussian → Sobel → NMS → Hysteresis
-    │
-    ├── tests/
-    │   └── test_detector.cpp       # CLI test harness: runs detectors on image directories
-    │
-    ├── examples/
-    │   ├── matrix_multiply.c       # MPI matrix multiply benchmark (Milestone 1)
-    │   └── mpi_latency_test.c      # MPI communication benchmark (Milestone 1)
-    │
-    └── vision/                     # Milestone 1: FFT architectures + baselines
-        ├── baselines.cpp           # Sequential Sobel / Canny / LoG baselines
-        ├── fft_arch1_farm.cpp      # OpenMP farm FFT
-        ├── fft_arch2_pipeline.cpp  # OpenMP pipeline FFT
-        ├── fft_arch3_dist_dynamic.cpp # MPI scatter-gather FFT
-        ├── fft_arch4_dist_pipeline.cpp # MPI pipeline FFT
-        ├── fft_utils.h             # FFT helper utilities
-        ├── stb_image.h
-        └── stb_image_write.h
+├── include/                          # Shared C++ headers (sequential harness)
+│   ├── sobel.hpp, canny.hpp, image_io.hpp, timing.hpp, utils.hpp
+│   ├── stb_image.h, stb_image_write.h
+│
+├── src/                              # Sequential detector implementations
+│   ├── sobel.cpp, canny.cpp
+│
+├── tests/
+│   └── test_detector.cpp             # CLI harness: runs detectors on image directories
+│
+├── examples/
+│   ├── matrix_multiply.c, mpi_latency_test.c
+│
+└── vision/                           # Parallel architecture source files
+    ├── README_METRICS.md
+    ├── sobel/                        # sobel_arch1–4
+    ├── canny/                        # canny_arch1–4
+    ├── log/                          # log_arch1–4
+    ├── fft/                          # fft_arch1–4
+    ├── resilience/                   # resilience_test.cpp, bully_election.cpp
+    └── shared/                       # stb_image.h/write, fft_utils.h, halo_utils.h,
+                                      # metrics.h, baselines.cpp
 ```
 
 ---
@@ -63,154 +62,167 @@ rpi-vision-cluster/
 ## Quick Start
 
 ### Prerequisites
-- Docker 29.2.1+
-- Docker Compose 5.0.2+
-- 8GB+ RAM, 15GB+ disk space
+- Docker 29.2.1+, Docker Compose 5.0.2+
+- 8 GB+ RAM, 15 GB+ disk space
 
-### 1. Start the Cluster
-
-```bash
-make setup          # Default: 2 nodes (1 master + 1 worker)
-make setup NODES=4  # 4 nodes (1 master + 3 workers)
-```
-
-### 2. Download Datasets
+### 1. Start the cluster
 
 ```bash
-./download_substantial_datasets.sh
+make setup          # 2 nodes (1 master + 1 worker)
+make setup NODES=4  # 4 nodes
 ```
 
-This downloads into `workspace/vision/datasets/`:
-- `cifar-10/` — 32×32 images
-- `tiny-imagenet-200/` — 64×64 images
-- `coco-val2017/` — high-resolution images
-- `BSDS500/` — **BSD500** edge detection benchmark (Milestone 2 primary dataset)
-  - `data/images/{train,val,test}/*.jpg` — 500 natural images (481×321 or 321×481)
-  - `data/groundTruth/{train,val,test}/*.mat` — per-annotator boundary maps
+### 2. Run a benchmark
 
-### 3. Build the Milestone 2 Detectors
-
-Inside the cluster (via `make shell`), build using the workspace Makefile:
+Each analysis script **manages its own datasets automatically** — no separate download step needed.
+On first run it downloads what it needs; on subsequent runs it reuses what's already present.
 
 ```bash
-make shell
-cd /home/pi/workspace
-make all        # builds build/test_detector
-```
-
-Or from the host via the root Makefile:
-
-```bash
-make compile FILE=src/sobel.cpp OUTPUT=sobel_obj   # compile individual objects
-# Or compile the full test harness:
-make compile FILE=tests/test_detector.cpp OUTPUT=test_detector
-```
-
-### 4. Run the Test Harness
-
-```bash
-# Run Sobel on 10 images from the BSD500 test set
-make run FILE=test_detector NODES=1 \
-  ARGS="--detector sobel -n 10 --images-path vision/datasets/BSDS500/data/images/test"
-
-# Run Canny on 50 random images, saving outputs
-make run FILE=test_detector NODES=1 \
-  ARGS="--detector canny -n 50 --random --images-path vision/datasets/BSDS500/data/images/test"
-
-# Full flag reference:
-#   --detector sobel|canny     (required)
-#   -n N                       number of images (default: 1)
-#   --random                   shuffle image selection
-#   --output true|false        save PNG outputs (default: true)
-#   --seed N                   RNG seed (default: 42)
-#   --images-path PATH         path to image directory
-```
-
-Results are saved to `workspace/results/<detector>/`:
-- `results.csv` — per-image timing and throughput
-- `images/*.png` — edge-detected output images
-
----
-
-## Compiling the Full Architecture Suite (Milestone 2 Plan)
-
-The four parallel architectures from `milestone2_execution_plan.md` compile as follows:
-
-```bash
-# Architecture 1 — OpenMP Farm
-mpic++ workspace/vision/sobel_arch1_farm.cpp  -O2 -fopenmp -o sobel_arch1  -lm
-mpic++ workspace/vision/log_arch1_farm.cpp    -O2 -fopenmp -o log_arch1    -lm
-mpic++ workspace/vision/canny_arch1_farm.cpp  -O2 -fopenmp -o canny_arch1  -lm
-
-# Architecture 2 — OpenMP Pipeline
-mpic++ workspace/vision/sobel_arch2_pipeline.cpp -O2 -fopenmp -o sobel_arch2 -lm
-mpic++ workspace/vision/canny_arch2_pipeline.cpp -O2 -fopenmp -o canny_arch2 -lm
-
-# Architecture 3 — MPI Scatter-Gather
-mpic++ workspace/vision/sobel_arch3_scatter.cpp -O2 -o sobel_arch3 -lm
-mpic++ workspace/vision/log_arch3_scatter.cpp   -O2 -o log_arch3   -lm
-mpic++ workspace/vision/canny_arch3_scatter.cpp -O2 -o canny_arch3 -lm
-
-# Architecture 4 — MPI Pipeline
-mpic++ workspace/vision/canny_arch4_pipeline.cpp -O2 -o canny_arch4 -lm
-```
-
-Or use the root Makefile (builds inside the ARM64 container with `-fopenmp` automatically):
-
-```bash
-make compile FILE=vision/sobel_arch1_farm.cpp OUTPUT=sobel_arch1
-make run FILE=sobel_arch1 NODES=1 ARGS="vision/datasets/BSDS500/data/images/test/100075.jpg /tmp/out.png 4"
-```
-
----
-
-## BSD500 Ground Truth Loading (Python)
-
-```python
-import scipy.io
-import numpy as np
-
-def load_ground_truth(mat_path):
-    """Load union of all annotator boundary maps from a BSDS500 .mat file."""
-    gt = scipy.io.loadmat(mat_path)['groundTruth']
-    num_annotators = gt.shape[1]
-    union = np.zeros_like(gt[0, 0]['Boundaries'][0, 0], dtype=np.uint8)
-    for i in range(num_annotators):
-        boundary = gt[0, i]['Boundaries'][0, 0]
-        union = np.logical_or(union, boundary).astype(np.uint8)
-    return union * 255  # binary edge map: 0 or 255
-```
-
-Images are 481×321 or 321×481. Pad to 512×512 for FFT architectures:
-```python
-from scipy.fft import next_fast_len
-size = next_fast_len(max(481, 321))  # = 512
-```
-
----
-
-## Benchmark Harness
-
-```bash
-# Ensure cluster is running with 6 nodes
-make start NODES=6
-
-# Run full benchmark suite (generates benchmark_results.csv)
+# Performance benchmark (CIFAR / Tiny ImageNet / COCO)
 ./run_analysis.sh
+
+# BSDS500 quality benchmark
+./run_analysis_bsds.sh
+
+# Resilience & bully election
+./resilience_analysis.sh
 ```
 
-The `run_analysis.sh` script tests:
-- Serial baselines
-- OpenMP scaling (Arch 1): T = 1, 2, 4 threads
-- MPI scaling (Arch 3): P = 2, 4, 6 nodes
-- Fixed configurations for Arch 2 and Arch 4
-- Arch 4 pipeline streaming: batch sizes N = 1, 4, 8, 16, 32
+If something looks wrong with the data, pass `--fix` to wipe and redownload from scratch:
+
+```bash
+./run_analysis.sh       --fix
+./run_analysis_bsds.sh  --fix
+./resilience_analysis.sh --fix
+```
+
+### 3. Clean generated outputs
+
+```bash
+make clean-results   # deletes reports/, logs, workspace/results/ — keeps compiled binaries
+```
+
+---
+
+## Dataset Management
+
+All three analysis scripts share the same download-once / reuse pattern:
+
+| Default (no flag) | `--fix` |
+|---|---|
+| Check if dataset present in container | Wipe dataset dir in container |
+| Skip download if images found | Re-download from source |
+| Discover first image dynamically | Discover first image dynamically |
+| Fail with helpful error if missing | Always gives fresh data |
+
+All dataset paths are resolved dynamically via `find` after the ensure step, so the scripts
+work regardless of minor differences in directory layout between machines or Kaggle download
+versions. The container workspace root `/home/pi/workspace` is fixed by the Docker bind-mount
+and treated as a constant (`CONT_WS`).
+
+### Datasets used
+
+| Script | Datasets | Source |
+|---|---|---|
+| `run_analysis.sh` | CIFAR-10, Tiny ImageNet, COCO Val2017 | Toronto / Stanford / COCO |
+| `run_analysis_bsds.sh` | BSDS500 | Kaggle (balraj98/bsds500) |
+| `resilience_analysis.sh` | BSDS500 (primary), COCO Val2017 (fallback) | same as above |
+
+`download_substantial_datasets.sh` is still included as a convenience script if you want to
+pre-download everything in one shot before running any analysis.
+
+---
+
+## Benchmark Scripts
+
+### `run_analysis.sh` — Multi-image-size performance
+
+Tests all 4 algorithms x 4 architectures on three image sizes (32px, 64px, ~1MP).
+
+```bash
+./run_analysis.sh                          # full run, defaults
+./run_analysis.sh --quick                  # 1 image, fewer node/thread configs
+./run_analysis.sh --fix                    # redownload all datasets first
+./run_analysis.sh --skip-build             # skip recompilation
+./run_analysis.sh --nodes 2,4 --threads 1,4
+./run_analysis.sh --image /path/to/img.png # use a specific image, skip dataset check
+./run_analysis.sh --timeout 90             # per-run timeout in seconds
+```
+
+Output: `report/` directory + `analysis_results.log`
+
+### `run_analysis_bsds.sh` — BSDS500 quality benchmark
+
+Tests all 4 algorithms x 4 architectures on BSDS500 test images with SSIM/Dice/Jaccard scoring
+against ground-truth edge maps.
+
+```bash
+./run_analysis_bsds.sh                     # defaults (10 images)
+./run_analysis_bsds.sh --n-images 50
+./run_analysis_bsds.sh --quick             # 3 images, fewer configs
+./run_analysis_bsds.sh --fix               # redownload BSDS500 first
+./run_analysis_bsds.sh --skip-build
+./run_analysis_bsds.sh --nodes 2,4 --threads 1,4
+./run_analysis_bsds.sh --timeout 180
+```
+
+Output: `report_bsds/` directory + `report_bsds/analysis_bsds.log`
+
+### `resilience_analysis.sh` — Fault tolerance & bully election
+
+Runs four resilience scenarios (worker crash, slow node, coordinator recovery, partial result)
+and three bully election scenarios.
+
+```bash
+./resilience_analysis.sh                   # defaults (6 nodes)
+./resilience_analysis.sh --nodes 4         # min 3 required
+./resilience_analysis.sh --quick
+./resilience_analysis.sh --fix             # redownload BSDS500/COCO first
+./resilience_analysis.sh --image /path     # use a specific image
+./resilience_analysis.sh --timeout 120
+```
+
+Output: `report_resilience/` directory + `report_resilience/analysis_resilience.log`
+
+---
+
+## Building the Architecture Binaries
+
+From inside the cluster (`make shell`):
+
+```bash
+cd /home/pi/workspace
+make vision     # builds all 16 filter×arch binaries + bully + resilience into build/
+make all        # builds build/test_detector (sequential harness)
+```
+
+Or one at a time from the host:
+
+```bash
+make compile FILE=vision/sobel/sobel_arch1_farm.cpp OUTPUT=sobel_arch1
+make compile FILE=vision/resilience/bully_election.cpp OUTPUT=bully_election
+```
+
+All vision source files expect `-I./vision/shared`. This is set automatically by `make vision`
+and all three `run_analysis*.sh` scripts. For manual compilation:
+
+```bash
+mpic++ -std=c++17 -O2 -fopenmp -I./vision/shared \
+  vision/sobel/sobel_arch1_farm.cpp -o build/sobel_arch1 -lm
+```
+
+| Architecture | File pattern | Parallelism |
+|---|---|---|
+| Arch 1 | `*_arch1_farm.cpp` | OpenMP fork-join farm |
+| Arch 2 | `*_arch2_pipeline.cpp` | OpenMP stage pipeline |
+| Arch 3 | `*_arch3_scatter.cpp` | MPI scatter-gather |
+| Arch 4 | `*_arch4_pipeline.cpp` | MPI distributed pipeline |
 
 ---
 
 ## Makefile Reference
 
-### Cluster Lifecycle
+### Cluster lifecycle
 
 | Command | Description | Example |
 |---|---|---|
@@ -221,21 +233,23 @@ The `run_analysis.sh` script tests:
 | `make clean` | Remove containers (keep images) | `make clean` |
 | `make destroy` | Remove containers and images | `make destroy` |
 
-### Testing & Verification
+### Output management
+
+| Command | What it removes |
+|---|---|
+| `make clean-results` | `report/`, `report_bsds/`, `report_resilience/`, `workspace/results/`, log files |
+| `make clean` | Docker containers (not images, not results) |
+| `make destroy` | Docker containers + volumes + images (not results) |
+
+> `make clean-results` does **not** touch compiled binaries (`workspace/build/`) or datasets.
+> Run it before re-running an analysis script to ensure you're looking at fresh output.
+
+### Compilation
 
 | Command | Description | Example |
 |---|---|---|
-| `make test` | Run hello_cluster.py | `make test NODES=3` |
-| `make verify` | Verify cluster connectivity | `make verify NODES=5` |
-| `make shell` | SSH into master node | `make shell` |
-| `make status` | Show container status | `make status` |
-
-### Compilation & Execution
-
-| Command | Description | Example |
-|---|---|---|
-| `make compile FILE=...` | Compile C/C++ for ARM64 cluster | `make compile FILE=src/sobel.cpp` |
-| `make run FILE=... ARGS=...` | Run binary or Python script | `make run FILE=test_detector NODES=1 ARGS="--detector sobel -n 5"` |
+| `make compile FILE=...` | Compile C/C++ for ARM64 MPI | `make compile FILE=vision/sobel/sobel_arch1_farm.cpp OUTPUT=sobel_arch1` |
+| `make run FILE=... ARGS=...` | Run binary or Python script | `make run FILE=sobel_arch1 NODES=4` |
 
 Parameters: `NODES=N` (2-6), `FILE=path`, `OUTPUT=name`, `ARGS="..."`
 
@@ -244,19 +258,8 @@ Parameters: `NODES=N` (2-6), `FILE=path`, `OUTPUT=name`, `ARGS="..."`
 ## Milestones
 
 - [x] **M0: Virtual cluster & toolchain setup**
-  - Docker-based ARM64 emulation (2-6 nodes)
-  - Automated setup with `make setup`
-  - MPI latency and computation benchmarks
 - [x] **M1: Parallel FFT architectures + vision baselines**
-  - Four FFT parallel architectures (OpenMP farm/pipeline, MPI scatter/pipeline)
-  - Sequential baselines for Sobel, Canny, LoG
-  - CIFAR-10, Tiny ImageNet, COCO datasets
-- [ ] **M2: Sobel/Canny/LoG across 4 architectures + BSD500 evaluation** ← *current*
-  - Modular `SobelDetector` and `CannyDetector` C++ classes
-  - BSD500 dataset integration with ground-truth boundary evaluation
-  - Four parallel architectures for each filter
-  - PRAM analysis: Amdahl, Brent, Isoefficiency for each combination
-  - Jaccard, Dice, SSIM metrics in C++ (`metrics.h`)
+- [ ] **M2: Sobel/Canny/LoG across 4 architectures + BSDS500 evaluation** <- current
 - [ ] **M3: Physical cluster assembly & MPI**
 - [ ] **M4: Non-blocking communication & failover**
 - [ ] **M5: Integration & final benchmarks**
@@ -265,33 +268,37 @@ Parameters: `NODES=N` (2-6), `FILE=path`, `OUTPUT=name`, `ARGS="..."`
 
 ## Troubleshooting
 
-### "Container not running"
+**Container not running:** `make start NODES=2`
+
+**Dataset missing / corrupt data:**
 ```bash
-make start NODES=2
+./run_analysis.sh       --fix
+./run_analysis_bsds.sh  --fix
+./resilience_analysis.sh --fix
 ```
 
-### "Permission denied" errors
+**Ground-truth metrics skipped:** The BSDS500 download from Kaggle always includes ground-truth
+`.mat` files. If this warning appears it usually means the download was interrupted. Run
+`./run_analysis_bsds.sh --fix` to redownload.
+
+**Stale reports from a previous run:**
 ```bash
-docker exec -u root rpic_master chown -R pi:pi /home/pi/
+make clean-results
+./run_analysis_bsds.sh    # regenerates from scratch
 ```
 
-### "SSH connection refused"
-```bash
-sleep 3
-docker exec -u pi rpic_master mpirun -n 2 --host master,worker1 hostname
-```
-
-### ARM64 emulation not working
+**ARM64 emulation not working:**
 ```bash
 docker run --privileged --rm tonistiigi/binfmt --install all
-docker buildx ls
 ```
 
-### BSD500 .mat files not loading
+**Header not found compiling vision files:**
+Always include `-I./vision/shared`. The `make vision` target and all benchmark scripts add
+this automatically. For manual compilation add it explicitly.
+
+**Permission denied:**
 ```bash
-pip install scipy kagglehub
-# Verify ground truth path:
-ls workspace/vision/datasets/BSDS500/data/groundTruth/test/
+docker exec -u root rpic_master chown -R pi:pi /home/pi/
 ```
 
 ---
@@ -300,6 +307,5 @@ ls workspace/vision/datasets/BSDS500/data/groundTruth/test/
 
 - [MPI4Py Documentation](https://mpi4py.readthedocs.io/)
 - [OpenMPI Documentation](https://www.open-mpi.org/)
-- [BSD500 Dataset on Kaggle](https://www.kaggle.com/datasets/balraj98/berkeley-segmentation-dataset-500-bsds500)
+- [BSDS500 on Kaggle](https://www.kaggle.com/datasets/balraj98/berkeley-segmentation-dataset-500-bsds500)
 - [BSDS500 Paper](https://www2.eecs.berkeley.edu/Research/Projects/CS/vision/grouping/resources.html)
-- Milestone 2 execution plan: `milestone2_execution_plan.md` (see repo root or project docs)
