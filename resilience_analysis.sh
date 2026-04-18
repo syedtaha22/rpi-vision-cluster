@@ -97,23 +97,6 @@ docker compose version &>/dev/null || docker-compose --version &>/dev/null || di
 command -v timeout &>/dev/null || { log "[WARN] 'timeout' not found — tests will not be time-limited"; TIMEOUT_SECS=0; }
 log "Docker OK"
 
-# ── ARM64 Emulation ───────────────────────────────────────────────────────────
-section "STEP 0b: ARM64 (QEMU) Emulation"
-HOST_ARCH="$(uname -m)"
-log "  Host architecture: $HOST_ARCH"
-if [[ "$HOST_ARCH" == "x86_64" || "$HOST_ARCH" == "amd64" ]]; then
-    if grep -q "enabled" /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null; then
-        log "  ARM64 emulation already enabled"
-    else
-        log "  Enabling ARM64 emulation..."
-        docker run --privileged --rm tonistiigi/binfmt --install all \
-            2>&1 | tee -a "$LOG_FILE" \
-            || die "Failed to enable ARM64 emulation"
-    fi
-else
-    log "  Native ARM64 host"
-fi
-
 # ── Cluster helpers ───────────────────────────────────────────────────────────
 master_running() {
     local status
@@ -150,23 +133,12 @@ ensure_cluster() {
     cd "$SCRIPT_DIR"
 
     if images_exist; then
-        if docker run --rm --platform linux/arm64 pdc_project-master \
-               /bin/echo "arm64-ok" &>/dev/null; then
-            docker compose \
-                --profile 2-nodes --profile 3-nodes --profile 4-nodes \
-                --profile 5-nodes --profile 6-nodes \
-                down --remove-orphans 2>&1 | tail -3 | tee -a "$LOG_FILE"
-            docker compose --profile "${n}-nodes" up -d \
-                2>&1 | tee -a "$LOG_FILE" || die "docker compose up failed"
-        else
-            log "  Images not executable — rebuilding..."
-            docker compose \
-                --profile 2-nodes --profile 3-nodes --profile 4-nodes \
-                --profile 5-nodes --profile 6-nodes \
-                down --remove-orphans 2>&1 | tail -3 | tee -a "$LOG_FILE"
-            docker compose --profile "${n}-nodes" up -d --build \
-                2>&1 | tee -a "$LOG_FILE" || die "docker compose up --build failed"
-        fi
+    docker compose \
+        --profile 2-nodes --profile 3-nodes --profile 4-nodes \
+        --profile 5-nodes --profile 6-nodes \
+        down --remove-orphans 2>&1 | tail -3 | tee -a "$LOG_FILE"
+    docker compose --profile "${n}-nodes" up -d \
+        2>&1 | tee -a "$LOG_FILE" || die "docker compose up failed"
     else
         log "  No images — building (~5-10 min first run)..."
         docker compose --profile "${n}-nodes" up -d --build \
@@ -278,26 +250,32 @@ else
         fi
     fi
 
-    if [[ $BSDS_OK -eq 0 ]]; then
-        log "  BSDS500 not found — downloading via kagglehub..."
-        docker exec -u pi rpic_master bash -c "
-pip install -q kagglehub scipy 2>/dev/null || true
-python3 -c "
+if [[ $BSDS_OK -eq 0 ]]; then
+    log "  BSDS500 not found — downloading via kagglehub..."
+    cat > /tmp/download_bsds.py << PYEOF
 import kagglehub, shutil, os
+print('  Downloading BSDS500 from Kaggle...')
 path = kagglehub.dataset_download('balraj98/berkeley-segmentation-dataset-500-bsds500')
+print(f'  Downloaded to: {path}')
 dst = '$DS_ROOT/BSDS500'
-if os.path.exists(dst): shutil.rmtree(dst)
+if os.path.exists(dst):
+    shutil.rmtree(dst)
 shutil.copytree(path, dst)
-print('BSDS500 ready at', dst)
-"" 2>&1 | tee -a "$LOG_FILE" && BSDS_OK=1 || true
-        if [[ $BSDS_OK -eq 1 ]]; then
-            FIRST=$(docker exec -u pi rpic_master bash -c \
-                "find '$DS_ROOT/BSDS500' -name '*.jpg' 2>/dev/null | sort | head -1" \
-                2>/dev/null || true)
-            [[ -n "$FIRST" ]] && BSDS_DIR=$(docker exec -u pi rpic_master dirname "$FIRST")
-        fi
-    fi
+print('  BSDS500 ready at', dst)
+PYEOF
+    docker cp /tmp/download_bsds.py rpic_master:/tmp/download_bsds.py
+    docker exec -u pi rpic_master bash -c "
+        pip install -q kagglehub scipy 2>/dev/null || true
+        python3 /tmp/download_bsds.py
+    " 2>&1 | tee -a "$LOG_FILE" && BSDS_OK=1 || true
 
+    if [[ $BSDS_OK -eq 1 ]]; then
+        FIRST=$(docker exec -u pi rpic_master bash -c \
+            "find '$DS_ROOT/BSDS500' -name '*.jpg' 2>/dev/null | sort | head -1" \
+            2>/dev/null || true)
+        [[ -n "$FIRST" ]] && BSDS_DIR=$(docker exec -u pi rpic_master dirname "$FIRST")
+    fi
+fi
     if [[ $BSDS_OK -eq 1 ]]; then
         RES_IMG=$(docker exec -u pi rpic_master bash -c \
             "find '$BSDS_DIR' -name '*.jpg' 2>/dev/null | sort | head -1" \
