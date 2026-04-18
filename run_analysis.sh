@@ -24,6 +24,7 @@ NODE_COUNTS=(2 4 6)
 THREAD_COUNTS=(1 2 4)
 SKIP_BUILD=0
 QUICK=0
+FIX=0
 VERIFY=0            # --verify: skip cluster/run, just regenerate report from existing log
 CUSTOM_IMAGE=""
 TIMEOUT_SECS=120    # per-run guard against blocking MPI calls
@@ -63,6 +64,7 @@ LOG_FILE="$SCRIPT_DIR/analysis_results.log"
 REPORT_DIR="$SCRIPT_DIR/report"
 WS="$SCRIPT_DIR/workspace"
 BUILD="build"
+DS_ROOT="/home/pi/workspace/vision/datasets"
 
 mkdir -p "$REPORT_DIR" "$WS/results/out"
 
@@ -100,24 +102,6 @@ command -v docker &>/dev/null || die "Docker not found on PATH"
 docker compose version &>/dev/null || docker-compose --version &>/dev/null || die "Docker Compose not found"
 command -v timeout &>/dev/null || { log "[WARN] 'timeout' not found — runs will not be time-limited"; TIMEOUT_SECS=0; }
 log "Docker OK"
-
-# ── ARM64 Emulation ───────────────────────────────────────────────────────────
-section "STEP 0b: ARM64 (QEMU) Emulation"
-HOST_ARCH="$(uname -m)"
-log "  Host architecture: $HOST_ARCH"
-if [[ "$HOST_ARCH" == "x86_64" || "$HOST_ARCH" == "amd64" ]]; then
-    if grep -q "enabled" /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null; then
-        log "  ARM64 emulation already enabled"
-    else
-        log "  Enabling ARM64 emulation via tonistiigi/binfmt..."
-        docker run --privileged --rm tonistiigi/binfmt --install all \
-            2>&1 | tee -a "$LOG_FILE" \
-            || die "Failed to enable ARM64 emulation"
-        log "  ARM64 emulation enabled"
-    fi
-else
-    log "  Native ARM64 host — no emulation needed"
-fi
 
 # ── Cluster helpers ───────────────────────────────────────────────────────────
 MAX_NODES="${NODE_COUNTS[-1]}"
@@ -157,24 +141,12 @@ ensure_cluster() {
     cd "$SCRIPT_DIR"
 
     if images_exist; then
-        log "  Images exist — testing arm64 compatibility..."
-        if docker run --rm --platform linux/arm64 pdc_project-master \
-               /bin/echo "arm64-ok" &>/dev/null; then
-            docker compose \
-                --profile 2-nodes --profile 3-nodes --profile 4-nodes \
-                --profile 5-nodes --profile 6-nodes \
-                down --remove-orphans 2>&1 | tail -3 | tee -a "$LOG_FILE"
-            docker compose --profile "${n}-nodes" up -d \
-                2>&1 | tee -a "$LOG_FILE" || die "docker compose up failed"
-        else
-            log "  Images not executable — rebuilding..."
-            docker compose \
-                --profile 2-nodes --profile 3-nodes --profile 4-nodes \
-                --profile 5-nodes --profile 6-nodes \
-                down --remove-orphans 2>&1 | tail -3 | tee -a "$LOG_FILE"
-            docker compose --profile "${n}-nodes" up -d --build \
-                2>&1 | tee -a "$LOG_FILE" || die "docker compose up --build failed"
-        fi
+    docker compose \
+        --profile 2-nodes --profile 3-nodes --profile 4-nodes \
+        --profile 5-nodes --profile 6-nodes \
+        down --remove-orphans 2>&1 | tail -3 | tee -a "$LOG_FILE"
+    docker compose --profile "${n}-nodes" up -d \
+        2>&1 | tee -a "$LOG_FILE" || die "docker compose up failed"
     else
         log "  No images — building from scratch (first run ~5-10 min)..."
         docker compose --profile "${n}-nodes" up -d --build \
@@ -255,76 +227,84 @@ docker exec -u pi rpic_master \
 # ── Step 2: Dataset management ───────────────────────────────────────────────
 section "STEP 2: Dataset management (--fix=$FIX)"
 
-# ensure_dataset <label> <dir_in_container> <find_pattern> <var_name>
+## ensure_dataset <label> <dir_in_container> <find_pattern> <var_name>
 # Downloads dataset if absent (or wipes + redownloads if FIX=1).
 # Sets the named variable to the first discovered image path.
 ensure_dataset() {
     local label="$1" ds_dir="$2" pattern="$3" retvar="$4"
+
     if [[ $FIX -eq 1 ]]; then
         log "  [FIX] Removing $label for redownload..."
         docker exec -u pi rpic_master rm -rf "$ds_dir" 2>/dev/null || true
     fi
+
     local count
     count=$(docker exec -u pi rpic_master bash -c \
         "find '$ds_dir' -name '$pattern' 2>/dev/null | wc -l" 2>/dev/null || echo 0)
+
     if [[ $count -gt 0 ]]; then
         log "  [OK] $label already present ($count images)"
     else
         log "  Downloading $label..."
         case "$label" in
-          CIFAR-10)
-            docker exec -u pi rpic_master bash -c "
-pip install -q Pillow numpy 2>/dev/null || true
-mkdir -p $ds_dir
-cd $DS_ROOT
-wget -q -nc --show-progress https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz 2>&1 || true
-tar -xzf cifar-10-python.tar.gz 2>/dev/null || true
-python3 -c "
-import pickle, numpy as np, os
-try:
-    from PIL import Image
-except ImportError:
-    import subprocess; subprocess.run(['pip','install','-q','Pillow'])
-    from PIL import Image
-src='$DS_ROOT/cifar-10-batches-py/data_batch_1'
-out='$ds_dir'
-os.makedirs(out, exist_ok=True)
-with open(src,'rb') as f:
-    d=pickle.load(f,encoding='bytes')
-data,names=d[b'data'],d[b'filenames']
-for i in range(min(100,len(data))):
-    r,g,b=data[i][:1024].reshape(32,32),data[i][1024:2048].reshape(32,32),data[i][2048:].reshape(32,32)
-    Image.fromarray(np.dstack((r,g,b))).save(os.path.join(out,names[i].decode()))
+            CIFAR-10)
+                # Write Python script to a temp file to avoid quoting issues
+                cat > /tmp/extract_cifar.py << 'PYEOF'
+import pickle, numpy as np, os, sys
+from PIL import Image
+ds_root = sys.argv[1]
+out_dir = sys.argv[2]
+src = os.path.join(ds_root, 'cifar-10-batches-py', 'data_batch_1')
+os.makedirs(out_dir, exist_ok=True)
+with open(src, 'rb') as f:
+    d = pickle.load(f, encoding='bytes')
+data, names = d[b'data'], d[b'filenames']
+for i in range(min(100, len(data))):
+    r = data[i][:1024].reshape(32, 32)
+    g = data[i][1024:2048].reshape(32, 32)
+    b = data[i][2048:].reshape(32, 32)
+    Image.fromarray(np.dstack((r, g, b))).save(
+        os.path.join(out_dir, names[i].decode()))
 print('CIFAR-10 extracted')
-"
-rm -rf $DS_ROOT/cifar-10-batches-py $DS_ROOT/cifar-10-python.tar.gz 2>/dev/null || true
-" 2>&1 | tee -a "$LOG_FILE" || log "  [WARN] CIFAR-10 download failed"
-            ;;
-          TinyImageNet)
-            docker exec -u pi rpic_master bash -c "
-mkdir -p $DS_ROOT
-cd $DS_ROOT
-wget -q -nc --show-progress http://cs231n.stanford.edu/tiny-imagenet-200.zip 2>&1 || true
-unzip -q tiny-imagenet-200.zip 2>/dev/null || true
-rm -f tiny-imagenet-200.zip 2>/dev/null || true
-" 2>&1 | tee -a "$LOG_FILE" || log "  [WARN] TinyImageNet download failed"
-            ;;
-          COCO-Val2017)
-            docker exec -u pi rpic_master bash -c "
-mkdir -p $DS_ROOT
-cd $DS_ROOT
-wget -q -nc --show-progress http://images.cocodataset.org/zips/val2017.zip 2>&1 || true
-unzip -q val2017.zip 2>/dev/null || true
-mv val2017 coco-val2017 2>/dev/null || true
-rm -f val2017.zip 2>/dev/null || true
-" 2>&1 | tee -a "$LOG_FILE" || log "  [WARN] COCO download failed"
-            ;;
+PYEOF
+                docker cp /tmp/extract_cifar.py rpic_master:/tmp/extract_cifar.py
+                docker exec -u pi rpic_master bash -c "
+                    pip install -q Pillow numpy 2>/dev/null || true
+                    mkdir -p '$ds_dir'
+                    cd '$DS_ROOT'
+                    wget -q -nc --show-progress https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz 2>&1 || true
+                    tar -xzf cifar-10-python.tar.gz 2>/dev/null || true
+                    python3 /tmp/extract_cifar.py '$DS_ROOT' '$ds_dir'
+                    rm -rf '$DS_ROOT/cifar-10-batches-py' '$DS_ROOT/cifar-10-python.tar.gz' 2>/dev/null || true
+                " 2>&1 | tee -a "$LOG_FILE" || log "  [WARN] CIFAR-10 download failed"
+                ;;
+            TinyImageNet)
+                docker exec -u pi rpic_master bash -c "
+                    mkdir -p '$DS_ROOT'
+                    cd '$DS_ROOT'
+                    wget -q -nc --show-progress http://cs231n.stanford.edu/tiny-imagenet-200.zip 2>&1 || true
+                    unzip -q tiny-imagenet-200.zip 2>/dev/null || true
+                    rm -f tiny-imagenet-200.zip 2>/dev/null || true
+                " 2>&1 | tee -a "$LOG_FILE" || log "  [WARN] TinyImageNet download failed"
+                ;;
+            COCO-Val2017)
+                docker exec -u pi rpic_master bash -c "
+                    mkdir -p '$DS_ROOT'
+                    cd '$DS_ROOT'
+                    wget -q -nc --show-progress http://images.cocodataset.org/zips/val2017.zip 2>&1 || true
+                    unzip -q val2017.zip 2>/dev/null || true
+                    mv val2017 coco-val2017 2>/dev/null || true
+                    rm -f val2017.zip 2>/dev/null || true
+                " 2>&1 | tee -a "$LOG_FILE" || log "  [WARN] COCO download failed"
+                ;;
         esac
     fi
+
     # Discover first image dynamically
     local img
     img=$(docker exec -u pi rpic_master bash -c \
         "find '$ds_dir' -name '$pattern' 2>/dev/null | sort | head -1" 2>/dev/null || true)
+
     if [[ -z "$img" ]]; then
         log "  [WARN] No $pattern found under $ds_dir — $label runs will be skipped"
     else
@@ -334,24 +314,21 @@ rm -f val2017.zip 2>/dev/null || true
 }
 
 if [[ -n "$CUSTOM_IMAGE" ]]; then
-    # --image provided: skip all dataset management
     log "  Custom image specified — skipping dataset management"
     docker exec -u pi rpic_master test -f "$CUSTOM_IMAGE" 2>/dev/null \
         || die "Custom image not found in container: $CUSTOM_IMAGE"
     IMAGES=("$CUSTOM_IMAGE")
 else
-    ensure_dataset "CIFAR-10"     "$DS_ROOT/cifar-10"             "*.png"  CIFAR_IMG
-    ensure_dataset "TinyImageNet" "$DS_ROOT/tiny-imagenet-200"    "*.JPEG" TINY_IMG
-    # TinyImageNet fallback: also try .jpeg or .jpg
+    ensure_dataset "CIFAR-10"     "$DS_ROOT/cifar-10"          "*.png"  CIFAR_IMG
+    ensure_dataset "TinyImageNet" "$DS_ROOT/tiny-imagenet-200" "*.JPEG" TINY_IMG
     if [[ -z "$TINY_IMG" ]]; then
         ensure_dataset "TinyImageNet" "$DS_ROOT/tiny-imagenet-200" "*.jpeg" TINY_IMG
     fi
     if [[ -z "$TINY_IMG" ]]; then
         ensure_dataset "TinyImageNet" "$DS_ROOT/tiny-imagenet-200" "*.jpg"  TINY_IMG
     fi
-    ensure_dataset "COCO-Val2017" "$DS_ROOT/coco-val2017"         "*.jpg"  COCO_IMG
+    ensure_dataset "COCO-Val2017" "$DS_ROOT/coco-val2017"      "*.jpg"  COCO_IMG
 
-    # Build IMAGES array from whatever was found
     for img in "$CIFAR_IMG" "$TINY_IMG" "$COCO_IMG"; do
         [[ -n "$img" ]] && IMAGES+=("$img")
     done
