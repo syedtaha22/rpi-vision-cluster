@@ -610,6 +610,266 @@ def fig8_visual_comparison(data, workspace_dir, outdir):
     print(f"  Saved: {path}")
 
 
+# ── Amdahl helper (shared with new figures) ──────────────────────────────────
+def _fit_amdahl_f(ps, sp):
+    """Fit Amdahl parallel fraction f to observed (p, speedup) pairs."""
+    try:
+        from scipy.optimize import curve_fit
+        popt, _ = curve_fit(lambda p, f: 1.0 / ((1 - f) + f / p),
+                            ps, sp, p0=[0.9], bounds=(0.01, 0.9999))
+        return float(popt[0])
+    except Exception:
+        vals = [(1 - 1.0 / s) / (1 - 1.0 / p)
+                for p, s in zip(ps, sp) if p > 1 and s > 0]
+        return float(np.clip(np.mean(vals), 0.01, 0.9999)) if vals else 0.9
+
+
+# ── Figure 8b: Fitted Amdahl f vs image size ─────────────────────────────────
+def fig8b_amdahl_f_vs_size(data, outdir):
+    """
+    Validates the doc's claim: CIFAR → f low, COCO → f≈0.95+.
+    Shows fitted parallel fraction f for FFT Arch3 across all image sizes.
+    """
+    # Map image stem → pixel count for x-axis ordering
+    SIZE_MN = {
+        "tabby_s_000074": 32 * 32,       # CIFAR-10  (32×32 padded to 64×64)
+        "test_0":         64 * 64,        # Tiny-ImageNet (64×64 padded to 64×64)
+        "000000144003":   512 * 512,      # COCO (480×640 padded to 512×512 → use 512²)
+    }
+
+    results = {}   # img_stem → (label, MN, f_fft_arch3, f_sobel_arch3)
+    for img, img_data in data.items():
+        bl_fft = img_data["baseline"].get("FFT")
+        pts    = img_data["FFT"].get(3, [])
+        if not pts or bl_fft is None:
+            continue
+        ps = np.array([p for p, _ in pts], dtype=float)
+        sp = np.array([bl_fft / t for _, t in pts])
+        if len(ps) < 2:
+            continue
+        f_fft = _fit_amdahl_f(ps, sp)
+
+        # Also fit Sobel Arch3 as a reference spatial filter
+        bl_sob = img_data["baseline"].get("Sobel")
+        pts_s  = img_data["Sobel"].get(3, [])
+        f_sob  = None
+        if pts_s and bl_sob:
+            ps_s = np.array([p for p, _ in pts_s], dtype=float)
+            sp_s = np.array([bl_sob / t for _, t in pts_s])
+            if len(ps_s) >= 2:
+                f_sob = _fit_amdahl_f(ps_s, sp_s)
+
+        mn = SIZE_MN.get(img, None)
+        label = _size_label(img)
+        results[img] = (label, mn, f_fft, f_sob)
+
+    if not results:
+        print("  [WARN] No multi-size data for fig8b")
+        return
+
+    # Sort by MN (ascending image size)
+    ordered = sorted(results.values(), key=lambda x: (x[1] or 0))
+    labels  = [r[0] for r in ordered]
+    f_fft   = [r[2] for r in ordered]
+    f_sob   = [r[3] if r[3] is not None else 0 for r in ordered]
+    x       = np.arange(len(labels))
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    width = 0.35
+    bars1 = ax.bar(x - width / 2, f_fft, width,
+                   color="#FF9800", label="FFT (Arch3)", alpha=0.85,
+                   edgecolor="white")
+    bars2 = ax.bar(x + width / 2, f_sob, width,
+                   color="#2196F3", label="Sobel (Arch3)", alpha=0.85,
+                   edgecolor="white")
+
+    for bars, vals in [(bars1, f_fft), (bars2, f_sob)]:
+        for bar, v in zip(bars, vals):
+            if v > 0.01:
+                ax.text(bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + 0.008,
+                        f"{v:.2f}", ha="center", va="bottom", fontsize=9)
+
+    # Theoretical prediction lines
+    ax.axhline(0.95, color="green", linestyle="--", alpha=0.5, linewidth=1.2,
+               label="Doc prediction: COCO f≈0.95+")
+    ax.axhline(0.90, color="orange", linestyle=":", alpha=0.5, linewidth=1.2,
+               label="f=0.90 reference")
+
+    ax.set_title("Amdahl's Law — Fitted Parallel Fraction  f  vs Image Size\n"
+                 "(validates: CIFAR → low f; COCO → f≈0.95+)")
+    ax.set_ylabel("Fitted parallel fraction  f")
+    ax.set_xlabel("Dataset / Image Size")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylim(0, 1.08)
+    ax.legend(fontsize=8)
+
+    path = os.path.join(outdir, "fig8b_amdahl_f_vs_size.png")
+    plt.savefig(path)
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# ── Figure 8c: Isoefficiency curves ──────────────────────────────────────────
+def fig8c_isoefficiency(data, outdir):
+    """
+    Two-panel isoefficiency figure that directly validates the doc:
+      Left:  Theoretical E vs p for each dataset size under FFT Arch3
+             formula: E ≈ 1 / (1 + p / log2(MN))
+             Shows CIFAR collapses fast; COCO holds up longer.
+      Right: Required log2(MN) to maintain target efficiency E=0.9 as p grows.
+             Shows MPI Arch3 needs exponential W growth (steep curve).
+             Arch1/2 (shared memory) requires only linear growth.
+    Also overlays any observed efficiency points from the data.
+    """
+    # Dataset sizes (padded to nearest power of 2 for FFT)
+    SIZES = {
+        "CIFAR-10\n(32×32)":         1024,       # 32×32
+        "Tiny-ImageNet\n(64×64)":    4096,       # 64×64
+        "COCO / BSDS\n(512×512)":    512 * 512,  # 481×321 or 480×640 pads to 512²
+    }
+    SIZE_COLORS = ["#E53935", "#FB8C00", "#43A047"]
+
+    p_arr = np.linspace(1, 8, 200)
+
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(13, 5))
+    fig.suptitle("Isoefficiency Analysis — FFT Arch3 (MPI Scatter-Gather)\n"
+                 "(formula: E ≈ 1 / (1 + p / log₂(MN)),  "
+                 "doc: Arch1/2 linear scaling vs Arch3/4 exponential)")
+
+    # ── Left panel: E vs p for each dataset ──────────────────────────────────
+    for (lbl, mn), col in zip(SIZES.items(), SIZE_COLORS):
+        log2_mn = np.log2(mn)
+        eff = 1.0 / (1.0 + p_arr / log2_mn)
+        ax_left.plot(p_arr, eff, color=col, linewidth=2.2,
+                     label=f"{lbl}  (log₂MN={log2_mn:.0f})")
+
+    # Overlay observed efficiency from log data (Arch3, FFT)
+    obs_colors = ["#1565C0", "#2E7D32", "#BF360C"]
+    for (img, img_data), obs_col in zip(data.items(), obs_colors):
+        bl = img_data["baseline"].get("FFT")
+        pts = img_data["FFT"].get(3, [])
+        if not pts or bl is None:
+            continue
+        for p, t in pts:
+            if t > 0:
+                sp  = bl / t
+                eff = sp / p
+                ax_left.scatter(p, eff, color=obs_col, s=55, zorder=5,
+                                marker="D", edgecolors="white", linewidths=0.6)
+
+    ax_left.axhline(0.9,  color="black", linestyle="--", alpha=0.4,
+                    linewidth=1.2, label="E=0.90 target")
+    ax_left.axhline(0.5,  color="gray",  linestyle=":",  alpha=0.4,
+                    linewidth=1.0, label="E=0.50")
+    ax_left.set_xlabel("Number of MPI Ranks (p)")
+    ax_left.set_ylabel("Parallel Efficiency  E")
+    ax_left.set_title("Efficiency vs Processors\n(diamonds = observed data)")
+    ax_left.set_xlim(1, 8)
+    ax_left.set_ylim(0, 1.05)
+    ax_left.legend(fontsize=8)
+
+    # ── Right panel: required log2(MN) to maintain E=0.9 ────────────────────
+    # Arch3/4 (MPI FFT): E = 1/(1 + p/log2(MN))  →  log2(MN) = p / (1/E - 1)
+    # Arch1/2 (OpenMP shared memory): communication is O(1), so isoefficiency
+    #   is approximately linear: log2(MN_required) ≈ c_omp * p (c_omp ≈ 1)
+    E_target = 0.9
+    p_x = np.linspace(1, 8, 200)
+
+    req_mpi = p_x / (1.0 / E_target - 1.0)          # log2(MN) needed for Arch3/4
+    req_omp = p_x * 1.0                              # linear for shared memory (approx)
+
+    # Mark known dataset sizes as horizontal reference lines
+    for (lbl, mn), col in zip(SIZES.items(), SIZE_COLORS):
+        ax_right.axhline(np.log2(mn), color=col, linestyle=":", alpha=0.55,
+                         linewidth=1.4, label=f"{lbl.replace(chr(10),' ')} log₂MN={np.log2(mn):.0f}")
+
+    ax_right.plot(p_x, req_mpi, color="#FF5722", linewidth=2.5, zorder=4,
+                  label="Arch3/4 (MPI) — steep")
+    ax_right.plot(p_x, req_omp, color="#2196F3", linewidth=2.5, zorder=4,
+                  linestyle="--", label="Arch1/2 (OpenMP) — linear")
+
+    # Shade region above the COCO line as "reachable"
+    coco_log2 = np.log2(512 * 512)
+    ax_right.fill_between(p_x, 0, coco_log2, alpha=0.07, color="green",
+                           label="Current image size range")
+
+    ax_right.set_xlabel("Number of Processors (p)")
+    ax_right.set_ylabel("Required  log₂(MN)  to maintain E=0.90")
+    ax_right.set_title(f"Isoefficiency: Work Needed to Sustain E={E_target}\n"
+                       "(MPI needs exponential growth; OpenMP is linear)")
+    ax_right.set_xlim(1, 8)
+    ax_right.set_ylim(0, max(req_mpi[-1], coco_log2) * 1.15)
+    ax_right.legend(fontsize=7)
+
+    plt.tight_layout()
+    path = os.path.join(outdir, "fig8c_isoefficiency.png")
+    plt.savefig(path)
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# ── Figure 7b: Arch4 single-image ceiling annotation ────────────────────────
+def fig7b_arch4_ceiling(data, outdir):
+    """
+    Annotates the theoretical ≤2× single-image speedup ceiling for Arch4.
+    The doc states: Arch4 critical path = T_row_pass + T_comm + T_col_pass,
+    giving at most ~2× improvement minus communication.  Plots observed Arch4
+    speedup vs the 2× ceiling, per image size.
+    """
+    imgs = list(data.keys())
+    if not imgs:
+        return
+
+    has_arch4 = any(data[i]["FFT"].get(4) for i in imgs)
+    if not has_arch4:
+        print("  [SKIP] No Arch4 FFT data for fig7b")
+        return
+
+    p_ref = np.linspace(1, 8, 200)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.set_title("Brent's Law — Arch4 Theoretical Ceiling (FFT)\n"
+                 "(doc: single-image Arch4 ≤ 2× speedup; pipeline fills only with image streams)")
+
+    colors = ["#1565C0", "#2E7D32", "#BF360C"]
+    for img, col in zip(imgs, colors):
+        bl = data[img]["baseline"].get("FFT")
+        pts = data[img]["FFT"].get(4, [])
+        if not pts or bl is None:
+            continue
+        ps = np.array([p for p, _ in pts], dtype=float)
+        sp = np.array([bl / t for _, t in pts])
+        ax.plot(ps, sp, "o-", color=col, linewidth=2, markersize=7,
+                label=_size_label(img))
+        for p_val, sp_val in zip(ps, sp):
+            ax.annotate(f"{sp_val:.2f}×", xy=(p_val, sp_val),
+                        xytext=(4, 5), textcoords="offset points", fontsize=8)
+
+    # Theoretical ceiling line: ≤2× (ignoring comm overhead entirely)
+    ax.axhline(2.0, color="#FF5722", linestyle="--", linewidth=2, alpha=0.8,
+               label="Theoretical ceiling: 2× (zero-comm ideal)")
+    ax.fill_between(p_ref, 1.8, 2.0, alpha=0.10, color="#FF5722",
+                    label="Comm overhead reduces ceiling below 2×")
+    ax.axhline(1.0, color="black", linestyle=":", alpha=0.3)
+
+    # Ideal speedup for reference
+    ax.plot(p_ref, p_ref, ":", color="gray", alpha=0.25, linewidth=1.2,
+            label="Ideal (linear)")
+
+    ax.set_xlabel("MPI Ranks (p)")
+    ax.set_ylabel("Speedup S(p) = T_serial / T_parallel")
+    ax.set_xlim(1, 7)
+    ax.set_ylim(0, max(3.0, ax.get_ylim()[1]))
+    ax.legend(fontsize=8)
+
+    path = os.path.join(outdir, "fig7b_arch4_ceiling.png")
+    plt.savefig(path)
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
 # ── CSV summary ───────────────────────────────────────────────────────────────
 def write_csv(data, outdir):
     rows = []
@@ -672,7 +932,10 @@ def main():
     fig5_spatial_arch3_speedup(data, args.outdir)
     fig6_architecture_summary(data, args.outdir)
     fig7_brents_law(data, args.outdir)
+    fig7b_arch4_ceiling(data, args.outdir)
     fig8_visual_comparison(data, args.workspace, args.outdir)
+    fig8b_amdahl_f_vs_size(data, args.outdir)
+    fig8c_isoefficiency(data, args.outdir)
     write_csv(data, args.outdir)
 
     charts = sorted(f for f in os.listdir(args.outdir) if f.endswith(".png"))

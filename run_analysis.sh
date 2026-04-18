@@ -24,6 +24,7 @@ NODE_COUNTS=(2 4 6)
 THREAD_COUNTS=(1 2 4)
 SKIP_BUILD=0
 QUICK=0
+VERIFY=0            # --verify: skip cluster/run, just regenerate report from existing log
 CUSTOM_IMAGE=""
 TIMEOUT_SECS=120    # per-run guard against blocking MPI calls
 
@@ -40,6 +41,7 @@ while [[ $# -gt 0 ]]; do
         --image)      CUSTOM_IMAGE="$2";                       shift 2 ;;
         --skip-build) SKIP_BUILD=1;                            shift   ;;
         --quick)      QUICK=1;                                 shift   ;;
+        --verify)     VERIFY=1;                                shift   ;;
         --fix)        FIX=1;                                   shift   ;;
         --timeout)    TIMEOUT_SECS="$2";                       shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -63,6 +65,22 @@ WS="$SCRIPT_DIR/workspace"
 BUILD="build"
 
 mkdir -p "$REPORT_DIR" "$WS/results/out"
+
+# ── Verify shortcut: just regenerate report from existing log ─────────────────
+if [[ $VERIFY -eq 1 ]]; then
+    if [[ ! -f "$LOG_FILE" ]]; then
+        echo "[VERIFY] No log found at $LOG_FILE — run without --verify first"
+        exit 1
+    fi
+    echo "[VERIFY] Re-running report generator from: $LOG_FILE"
+    python3 "$SCRIPT_DIR/generate_report.py" \
+        --log          "$LOG_FILE" \
+        --outdir       "$REPORT_DIR" \
+        --node-counts  "${NODE_COUNTS[*]}" \
+        --thread-counts "${THREAD_COUNTS[*]}"
+    exit $?
+fi
+
 : > "$LOG_FILE"
 
 # ── Logging ───────────────────────────────────────────────────────────────────

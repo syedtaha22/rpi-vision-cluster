@@ -24,6 +24,7 @@ THREAD_COUNTS=(1 2 4)
 SKIP_BUILD=0
 QUICK=0
 FIX=0               # --fix: wipe + redownload BSDS500 dataset
+VERIFY=0            # --verify: skip cluster/run, just regenerate report from existing log
 BSDS_N=10
 TIMEOUT_SECS=180    # per-run guard — BSDS images are larger than CIFAR/Tiny
 
@@ -44,6 +45,7 @@ while [[ $# -gt 0 ]]; do
         --skip-build) SKIP_BUILD=1;                            shift   ;;
         --quick)      QUICK=1;                                 shift   ;;
         --fix)        FIX=1;                                   shift   ;;
+        --verify)     VERIFY=1;                                shift   ;;
         --timeout)    TIMEOUT_SECS="$2";                       shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -63,6 +65,28 @@ WS="$SCRIPT_DIR/workspace"
 BUILD="build"
 
 mkdir -p "$OUT_DIR"
+
+# ── Verify shortcut: just regenerate report from existing log ─────────────────
+if [[ $VERIFY -eq 1 ]]; then
+    if [[ ! -f "$LOG_FILE" ]]; then
+        echo "[VERIFY] No log found at $LOG_FILE — run without --verify first"
+        exit 1
+    fi
+    echo "[VERIFY] Re-running BSDS report generator from: $LOG_FILE"
+    ORIG_ARG=""
+    [[ -d "$OUT_DIR/originals" ]] && ORIG_ARG="--orig-dir $OUT_DIR/originals"
+    GT_ARG=""
+    [[ -d "$OUT_DIR/gt" ]] && GT_ARG="--gt-dir $OUT_DIR/gt"
+    python3 "$SCRIPT_DIR/generate_report_bsds.py" \
+        --log           "$LOG_FILE" \
+        --outdir        "$OUT_DIR" \
+        --recon-dir     "$OUT_DIR/reconstructed" \
+        --node-counts   "${NODE_COUNTS[*]}" \
+        --thread-counts "${THREAD_COUNTS[*]}" \
+        $ORIG_ARG $GT_ARG
+    exit $?
+fi
+
 : > "$LOG_FILE"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -451,6 +475,21 @@ else
     log "  [WARN] No reconstructed images found — bsds_out missing"
 fi
 
+# Copy original BSDS test images so Python can build side-by-side comparisons
+mkdir -p "$OUT_DIR/originals"
+if [[ -n "$BSDS_LIST_HOST" && -f "$BSDS_LIST_HOST" ]]; then
+    while IFS= read -r orig_img; do
+        cp_dest="$OUT_DIR/originals/$(basename "$orig_img")"
+        # Extract from container if not already on the host bind-mount
+        docker exec -u pi rpic_master bash -c \
+            "cat '$orig_img'" > "$cp_dest" 2>/dev/null || true
+    done < "$BSDS_LIST_HOST"
+    orig_count=$(find "$OUT_DIR/originals" -name "*.jpg" -o -name "*.png" 2>/dev/null | wc -l)
+    log "  Original images → $OUT_DIR/originals/ ($orig_count files)"
+else
+    log "  [WARN] bsds_img_list.txt not found — originals not copied"
+fi
+
 # ── Step 10: Generate report ──────────────────────────────────────────────────
 section "STEP 10: Generating BSDS500 Report"
 GT_ARG=""
@@ -470,13 +509,15 @@ if [[ $GT_AVAILABLE -eq 1 ]]; then
 fi
 
 if command -v python3 &>/dev/null; then
+    ORIG_ARG=""
+    [[ -d "$OUT_DIR/originals" ]] && orig_count=$(find "$OUT_DIR/originals" -maxdepth 1 \( -name "*.jpg" -o -name "*.png" \) 2>/dev/null | wc -l) && [[ $orig_count -gt 0 ]] && ORIG_ARG="--orig-dir $OUT_DIR/originals"
     python3 "$SCRIPT_DIR/generate_report_bsds.py" \
         --log         "$LOG_FILE" \
         --outdir      "$OUT_DIR" \
         --recon-dir   "$OUT_DIR/reconstructed" \
         --node-counts "${NODE_COUNTS[*]}" \
         --thread-counts "${THREAD_COUNTS[*]}" \
-        $GT_ARG \
+        $GT_ARG $ORIG_ARG \
         2>&1 | tee -a "$LOG_FILE"
 else
     log "[WARN] python3 not found — run generate_report_bsds.py manually"

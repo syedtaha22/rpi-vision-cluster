@@ -26,6 +26,7 @@ RESILIENCE_NODES=6      # must be ≥ 3
 SKIP_BUILD=0
 QUICK=0
 FIX=0               # --fix: wipe + redownload datasets
+VERIFY=0            # --verify: skip cluster/run, just regenerate report from existing log
 CUSTOM_IMAGE=""
 TIMEOUT_SECS=120
 
@@ -45,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         --skip-build) SKIP_BUILD=1;            shift   ;;
         --quick)      QUICK=1;                 shift   ;;
         --fix)        FIX=1;                   shift   ;;
+        --verify)     VERIFY=1;                shift   ;;
         --timeout)    TIMEOUT_SECS="$2";       shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -60,6 +62,21 @@ WS="$SCRIPT_DIR/workspace"
 BUILD="build"
 
 mkdir -p "$OUT_DIR" "$WS/results/resilience"
+
+# ── Verify shortcut: just regenerate report from existing log ─────────────────
+if [[ $VERIFY -eq 1 ]]; then
+    if [[ ! -f "$LOG_FILE" ]]; then
+        echo "[VERIFY] No log found at $LOG_FILE — run without --verify first"
+        exit 1
+    fi
+    echo "[VERIFY] Re-running resilience report generator from: $LOG_FILE"
+    python3 "$SCRIPT_DIR/generate_report_resilience.py" \
+        --log            "$LOG_FILE" \
+        --outdir         "$OUT_DIR" \
+        --resilience-dir "$OUT_DIR/resilience_images"
+    exit $?
+fi
+
 : > "$LOG_FILE"
 
 # ── Logging ───────────────────────────────────────────────────────────────────

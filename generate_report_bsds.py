@@ -945,6 +945,376 @@ def fig11_arch_mean_time(all_data, outdir):
     print(f"  Saved: {path}")
 
 
+# ── Figure 1b: Serial baseline scatter (individual images) ───────────────────
+def fig1b_serial_baselines_scatter(all_data, outdir):
+    """Scatter of per-image baseline times alongside means — reveals spread."""
+    by_filter = defaultdict(list)
+    for img_data in all_data.values():
+        for flt in FILTERS:
+            v = img_data["baseline"].get(flt)
+            if v is not None:
+                by_filter[flt].append(v)
+
+    if not by_filter:
+        print("  [WARN] No baseline data for Fig 1b")
+        return
+
+    fkeys = [f for f in FILTERS if f in by_filter]
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    rng = np.random.default_rng(42)
+    for xi, flt in enumerate(fkeys):
+        vals = np.array(by_filter[flt])
+        color = FILTER_COLORS.get(flt, "#888")
+        # mean bar (light fill, no errbar — scatter shows spread)
+        ax.bar(xi, np.mean(vals), color=color, alpha=0.35,
+               edgecolor=color, linewidth=1.2, width=0.5, zorder=1)
+        ax.axhline(0, color="none")  # dummy for axis scaling
+        # individual image points with jitter
+        jitter = rng.uniform(-0.15, 0.15, size=len(vals))
+        ax.scatter(xi + jitter, vals, color=color, s=40, zorder=3,
+                   edgecolors="white", linewidths=0.5, alpha=0.85)
+        # mean marker
+        ax.scatter(xi, np.mean(vals), color=color, s=120, marker="D",
+                   zorder=4, edgecolors="black", linewidths=0.8)
+        ax.text(xi, np.mean(vals) + np.mean(vals) * 0.03,
+                f"{np.mean(vals):.3f}s", ha="center", va="bottom",
+                fontsize=8, fontweight="bold")
+
+    ax.set_title(f"Serial Baseline Filter Times — BSDS500\n"
+                 f"(each dot = 1 image, ◆ = mean, n={len(all_data)} images, 481×321)")
+    ax.set_ylabel("Wall-Clock Time (s)")
+    ax.set_xticks(range(len(fkeys)))
+    ax.set_xticklabels(fkeys)
+    ax.set_xlim(-0.6, len(fkeys) - 0.4)
+
+    path = os.path.join(outdir, "fig1b_serial_baselines_scatter.png")
+    plt.savefig(path)
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# ── Figure 5b: Arch3 spatial scatter — per-image speedup points ──────────────
+def fig5b_spatial_arch3_scatter(all_data, outdir):
+    """
+    Per-image speedup scatter overlaid on mean line for Sobel / Canny / LoG
+    at Arch3 (MPI Scatter-Gather). Complements the mean+errorbar of fig5.
+    """
+    spatial = ["Sobel", "Canny", "LoG"]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle("Arch3 (MPI Scatter-Gather) — Per-Image Speedup Scatter — BSDS500\n"
+                 "(each dot = 1 image; line = mean over images)")
+
+    rng = np.random.default_rng(0)
+
+    for ax, flt in zip(axes, spatial):
+        color = FILTER_COLORS[flt]
+
+        # Collect per-image speedups
+        per_img_sp = defaultdict(list)
+        baseline_vals = [img_data["baseline"].get(flt)
+                         for img_data in all_data.values()
+                         if img_data["baseline"].get(flt)]
+        if not baseline_vals:
+            ax.set_title(flt); ax.set_xlabel("MPI Ranks"); continue
+        bl_mean = np.mean(baseline_vals)
+
+        for img_data in all_data.values():
+            bl = img_data["baseline"].get(flt)
+            if bl is None:
+                continue
+            for p, t in img_data[flt].get(3, []):
+                if t > 0:
+                    per_img_sp[p].append(bl / t)
+
+        if not per_img_sp:
+            ax.set_title(flt); ax.set_xlabel("MPI Ranks"); continue
+
+        ps_sorted = sorted(per_img_sp.keys())
+        means = [np.mean(per_img_sp[p]) for p in ps_sorted]
+
+        # Scatter individual points with jitter
+        for p, sp_list in sorted(per_img_sp.items()):
+            jitter = rng.uniform(-0.12, 0.12, size=len(sp_list))
+            ax.scatter(np.array([p] * len(sp_list)) + jitter, sp_list,
+                       color=color, s=30, alpha=0.55,
+                       edgecolors="none", zorder=2)
+
+        # Mean line on top
+        ax.plot(ps_sorted, means, "o-", color=color,
+                linewidth=2.5, markersize=8, zorder=4, label="Mean speedup")
+        for p_val, sp_val in zip(ps_sorted, means):
+            ax.annotate(f"{sp_val:.2f}×", xy=(p_val, sp_val),
+                        xytext=(5, 6), textcoords="offset points", fontsize=8)
+        ax.axhline(1.0, color="black", linestyle=":", alpha=0.25)
+
+        ax.set_title(flt)
+        ax.set_xlabel("MPI Ranks")
+        if ax is axes[0]:
+            ax.set_ylabel("Speedup S(P)")
+        ax.legend(fontsize=8)
+
+    path = os.path.join(outdir, "fig5b_spatial_arch3_scatter.png")
+    plt.savefig(path)
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# ── Figure 10b: Per-image comparison (Original | Sobel | Canny | LoG | FFT) ──
+def fig10b_recon_per_image(recon_dir, orig_dir, outdir, max_images=6):
+    """
+    Report-style panel: each row = one test image.
+    Columns: Original | Sobel (best arch) | Canny (best arch) | LoG | FFT.
+    Matches the 'Original / Canny / Sobel' layout shown in the report figure.
+    Uses the highest-parallelism Arch3 output when available, else any output.
+    """
+    if not HAS_PIL:
+        print("  [SKIP] Pillow not installed")
+        return
+    if not os.path.isdir(recon_dir):
+        print(f"  [SKIP] recon_dir not found: {recon_dir}")
+        return
+
+    # ── 1. Build lookup: filter → {stem: best_path} ──────────────────────────
+    # Priority: arch3 (any node count), then arch1, then whatever exists
+    FILTER_TAGS = ["sobel", "canny", "log", "fft"]
+    FILTER_DISPLAY = ["Sobel", "Canny", "LoG", "FFT"]
+    ARCH_PRIORITY = [3, 1, 2, 4]  # prefer arch3 (MPI scatter best result)
+
+    best = {tag: {} for tag in FILTER_TAGS}  # tag → {stem: path}
+
+    if os.path.isdir(recon_dir):
+        for sub in sorted(os.listdir(recon_dir)):
+            sub_path = os.path.join(recon_dir, sub)
+            if not os.path.isdir(sub_path):
+                continue
+            m = re.match(r"(\w+)_arch(\d)", sub)
+            if not m:
+                continue
+            tag = m.group(1).lower()
+            arch_num = int(m.group(2))
+            if tag not in best:
+                continue
+            for fn in sorted(os.listdir(sub_path)):
+                if not fn.endswith(".png"):
+                    continue
+                stem = re.sub(r"^[a-z]+_arch\d[^_]*_", "", fn.replace(".png", ""))
+                existing = best[tag].get(stem)
+                if existing is None:
+                    best[tag][stem] = os.path.join(sub_path, fn)
+                else:
+                    # Prefer higher-priority arch
+                    existing_arch = int(re.search(r"arch(\d)", os.path.basename(
+                        os.path.dirname(existing))).group(1))
+                    if ARCH_PRIORITY.index(arch_num) < ARCH_PRIORITY.index(existing_arch):
+                        best[tag][stem] = os.path.join(sub_path, fn)
+
+    # ── 2. Collect stems that have at least one filter result ────────────────
+    all_stems = set()
+    for tag in FILTER_TAGS:
+        all_stems.update(best[tag].keys())
+    stems = sorted(all_stems)[:max_images]
+
+    if not stems:
+        print("  [SKIP] No reconstructed images found for per-image panel")
+        return
+
+    # ── 3. Build orig lookup ──────────────────────────────────────────────────
+    orig_lookup = {}
+    if orig_dir and os.path.isdir(orig_dir):
+        for fn in os.listdir(orig_dir):
+            stem_key = os.path.splitext(fn)[0]
+            orig_lookup[stem_key] = os.path.join(orig_dir, fn)
+
+    # ── 4. Layout: rows=images, cols=Original+filters ────────────────────────
+    has_orig = any(s in orig_lookup for s in stems)
+    col_labels = (["Original"] if has_orig else []) + FILTER_DISPLAY
+    n_cols = len(col_labels)
+    n_rows = len(stems)
+
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(2.8 * n_cols, 2.8 * n_rows),
+                             squeeze=False)
+    fig.suptitle("Per-Image Filter Comparison — BSDS500 Test Set\n"
+                 "(Arch3 MPI Scatter-Gather output where available)",
+                 fontsize=12, fontweight="bold")
+
+    for ri, stem in enumerate(stems):
+        col_idx = 0
+
+        # Original column
+        if has_orig:
+            ax = axes[ri][col_idx]
+            orig_path = orig_lookup.get(stem)
+            if orig_path and os.path.exists(orig_path):
+                try:
+                    img = PILImage.open(orig_path).convert("L")
+                    ax.imshow(np.array(img), cmap="gray", interpolation="lanczos")
+                except Exception:
+                    ax.text(0.5, 0.5, "err", ha="center", va="center",
+                            transform=ax.transAxes, fontsize=8)
+            else:
+                ax.text(0.5, 0.5, "N/A", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=10, color="gray")
+            ax.axis("off")
+            if ri == 0:
+                ax.set_title("Original", fontsize=9, fontweight="bold",
+                             pad=4)
+            col_idx += 1
+
+        # Filter columns
+        for tag, disp in zip(FILTER_TAGS, FILTER_DISPLAY):
+            ax = axes[ri][col_idx]
+            fpath = best[tag].get(stem)
+            if fpath and os.path.exists(fpath):
+                try:
+                    img = PILImage.open(fpath).convert("L")
+                    ax.imshow(np.array(img), cmap="gray", interpolation="lanczos")
+                except Exception:
+                    ax.text(0.5, 0.5, "err", ha="center", va="center",
+                            transform=ax.transAxes, fontsize=8)
+            else:
+                ax.text(0.5, 0.5, "—", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=14, color="#aaa")
+            ax.axis("off")
+            if ri == 0:
+                ax.set_title(disp, fontsize=9, fontweight="bold", pad=4)
+            col_idx += 1
+
+        # Row label (image stem)
+        axes[ri][0].set_ylabel(stem[:14], fontsize=7, rotation=0,
+                               ha="right", va="center", labelpad=48)
+
+    plt.tight_layout()
+    path = os.path.join(outdir, "fig10b_recon_per_image.png")
+    plt.savefig(path, dpi=120)
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
+# ── Figure 12: Isoefficiency for BSDS500 ─────────────────────────────────────
+def fig12_isoefficiency_bsds(all_data, outdir):
+    """
+    Validates Section 7.3 of the report: E ≈ 1 / (1 + P/log₂(MN)) for FFT Arch3.
+    Left:  Theoretical curve + observed efficiency data points.
+    Right: Required log₂(MN) to sustain target efficiency as p increases,
+           with BSDS500 (512×512 padded) marked as a reference line.
+    """
+    # BSDS500 pads 481×321 → 512×512
+    MN_BSDS = 512 * 512
+    LOG2_MN  = np.log2(MN_BSDS)          # ≈ 18.0
+
+    p_arr = np.linspace(1, 8, 300)
+    eff_theory = 1.0 / (1.0 + p_arr / LOG2_MN)
+
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(13, 5))
+    fig.suptitle(f"Isoefficiency Analysis — BSDS500 FFT Arch3\n"
+                 f"(512×512 padded, log₂(MN) = {LOG2_MN:.0f};  "
+                 f"formula: E ≈ 1 / (1 + p / log₂(MN)))")
+
+    # ── Left: theoretical E curve + observed points ───────────────────────────
+    ax_left.plot(p_arr, eff_theory, color="#FF5722", linewidth=2.5,
+                 label=f"Theoretical  (log₂MN={LOG2_MN:.0f})")
+
+    # Overlay reference curves for smaller / larger images
+    for mn_ref, lbl_ref, col_ref in [
+        (32 * 32,     "CIFAR (32×32)",     "#E53935"),
+        (64 * 64,     "Tiny (64×64)",      "#FB8C00"),
+        (4096 * 4096, "4K (4096×4096)",    "#43A047"),
+    ]:
+        e_ref = 1.0 / (1.0 + p_arr / np.log2(mn_ref))
+        ax_left.plot(p_arr, e_ref, linestyle=":", linewidth=1.4,
+                     color=col_ref, alpha=0.65, label=lbl_ref)
+
+    # Observed efficiency from data (Arch3, FFT)
+    obs_ps, obs_effs = [], []
+    for img_data in all_data.values():
+        bl = img_data["baseline"].get("FFT")
+        for p, t in img_data["FFT"].get(3, []):
+            if bl and t > 0:
+                sp = bl / t
+                obs_ps.append(p)
+                obs_effs.append(sp / p)
+
+    if obs_ps:
+        # Mean per p
+        from collections import defaultdict as _dd
+        bucket = _dd(list)
+        for p, e in zip(obs_ps, obs_effs):
+            bucket[p].append(e)
+        for p_val in sorted(bucket):
+            vals = bucket[p_val]
+            ax_left.scatter([p_val] * len(vals), vals,
+                            color="#9C27B0", s=30, alpha=0.45, zorder=4)
+            ax_left.scatter(p_val, np.mean(vals),
+                            color="#9C27B0", s=90, marker="D",
+                            edgecolors="white", linewidths=0.7, zorder=5)
+        # Annotate
+        for p_val in sorted(bucket):
+            mean_e = np.mean(bucket[p_val])
+            ax_left.annotate(f"{mean_e:.2f}",
+                             xy=(p_val, mean_e),
+                             xytext=(5, 6), textcoords="offset points", fontsize=8)
+
+    ax_left.axhline(0.9, color="black", linestyle="--", alpha=0.45,
+                    linewidth=1.2, label="E=0.90 target")
+    ax_left.axhline(0.5, color="gray",  linestyle=":",  alpha=0.35,
+                    linewidth=1.0, label="E=0.50")
+    ax_left.set_xlabel("MPI Ranks (p)")
+    ax_left.set_ylabel("Parallel Efficiency  E")
+    ax_left.set_title("E vs p  (◆ = empirical mean, · = per-image)")
+    ax_left.set_xlim(1, 8)
+    ax_left.set_ylim(0, 1.08)
+    ax_left.legend(fontsize=8)
+
+    # ── Right: required log₂(MN) to maintain E=0.9 ───────────────────────────
+    E_target  = 0.9
+    p_x       = np.linspace(1, 8, 200)
+    req_arch3 = p_x / (1.0 / E_target - 1.0)   # = 9p at E=0.9
+    req_omp   = p_x * 1.0                        # linear (shared memory)
+
+    ax_right.plot(p_x, req_arch3, color="#FF5722", linewidth=2.5, zorder=4,
+                  label="Arch3/4 (MPI) — steep  [= 9p at E=0.9]")
+    ax_right.plot(p_x, req_omp,   color="#2196F3", linewidth=2.5, linestyle="--",
+                  zorder=4, label="Arch1/2 (OpenMP) — linear")
+
+    # Mark BSDS500 actual size
+    ax_right.axhline(LOG2_MN, color="#FF9800", linestyle="-.", linewidth=1.8,
+                     label=f"BSDS500 512² (log₂MN≈{LOG2_MN:.0f})")
+
+    # Shade below BSDS500 as "already insufficient" region
+    ax_right.fill_between(p_x, req_arch3, LOG2_MN,
+                          where=(req_arch3 > LOG2_MN),
+                          alpha=0.12, color="#FF5722",
+                          label="Region where E<0.9 for BSDS500")
+
+    # Annotate the crossover point
+    crossover_p = LOG2_MN / 9.0
+    if 1 < crossover_p < 8:
+        ax_right.axvline(crossover_p, color="#FF9800", linestyle=":",
+                         alpha=0.6, linewidth=1.2)
+        ax_right.annotate(f"Crossover\np≈{crossover_p:.1f}",
+                          xy=(crossover_p, LOG2_MN),
+                          xytext=(crossover_p + 0.3, LOG2_MN * 0.9),
+                          fontsize=8, color="#BF360C",
+                          arrowprops=dict(arrowstyle="->", color="#BF360C",
+                                          lw=0.8))
+
+    ax_right.set_xlabel("Number of Processors (p)")
+    ax_right.set_ylabel("Required  log₂(MN)  to maintain E=0.90")
+    ax_right.set_title(f"Isoefficiency: Work Needed to Sustain E={E_target}\n"
+                       "(doc: 4K frames needed for 6-node efficiency)")
+    ax_right.set_xlim(1, 8)
+    ax_right.set_ylim(0, max(req_arch3[-1], LOG2_MN) * 1.2)
+    ax_right.legend(fontsize=7)
+
+    plt.tight_layout()
+    path = os.path.join(outdir, "fig12_isoefficiency_bsds.png")
+    plt.savefig(path)
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
 # ── CSV summary ───────────────────────────────────────────────────────────────
 def write_csv(all_data, outdir):
     rows = []
@@ -976,6 +1346,8 @@ def main():
     parser.add_argument("--log",           default="report_bsds/analysis_bsds.log")
     parser.add_argument("--outdir",        default="report_bsds")
     parser.add_argument("--recon-dir",     default="report_bsds/reconstructed")
+    parser.add_argument("--orig-dir",      default="",
+                        help="Directory of original BSDS test images for side-by-side comparison")
     parser.add_argument("--gt-dir",        default="")
     parser.add_argument("--node-counts",   default="2 4 6")
     parser.add_argument("--thread-counts", default="1 2 4")
@@ -983,7 +1355,8 @@ def main():
 
     node_counts   = [int(x) for x in args.node_counts.split()]
     thread_counts = [int(x) for x in args.thread_counts.split()]
-    gt_dir = args.gt_dir if args.gt_dir else None
+    gt_dir   = args.gt_dir   if args.gt_dir   else None
+    orig_dir = args.orig_dir if args.orig_dir else None
 
     if not os.path.exists(args.log):
         print(f"[ERROR] Log not found: {args.log}")
@@ -1001,20 +1374,24 @@ def main():
 
     print("Generating performance figures …")
     fig1_serial_baselines(data, args.outdir)
+    fig1b_serial_baselines_scatter(data, args.outdir)
     fig2_fft_arch_comparison(data, args.outdir)
     fig3_fft_arch3_panels(data, args.outdir)
     fig4_omp_scaling(data, args.outdir)
     fig5_spatial_arch3_speedup(data, args.outdir)
+    fig5b_spatial_arch3_scatter(data, args.outdir)
     fig6_all_archs_per_filter(data, args.outdir)
     fig7_amdahl_comparison(data, args.outdir)
     fig8_brents_law(data, args.outdir)
     fig11_arch_mean_time(data, args.outdir)
+    fig12_isoefficiency_bsds(data, args.outdir)
 
     print("\nGenerating quality metrics …")
     fig9_quality_metrics(args.recon_dir, gt_dir, args.outdir)
 
     print("\nGenerating reconstructed image grids …")
     fig10_recon_per_filter(args.recon_dir, args.outdir)
+    fig10b_recon_per_image(args.recon_dir, orig_dir, args.outdir)
 
     print("\nGenerating summary CSV …")
     write_csv(data, args.outdir)
