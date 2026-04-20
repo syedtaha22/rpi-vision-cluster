@@ -24,6 +24,8 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
+    const char* out_path = (argc > 2) ? argv[argc-1] : "fft_arch3_out.png";
+
     int new_w = 0, new_h = 0, orig_w = 0, orig_h = 0;
     vector<Complex> data;
     double t_start;
@@ -128,7 +130,7 @@ int main(int argc, char** argv) {
             float mag = sqrt(data[i].real() * data[i].real() + data[i].imag() * data[i].imag());
             out[i] = (unsigned char)(255.0f * mag / max_edge);
         }
-        stbi_write_png("fft_arch3_out.png", new_w, new_h, 1, out.data(), new_w);
+        stbi_write_png("out_path.png", new_w, new_h, 1, out.data(), new_w);
     }
 
     MPI_Finalize();

@@ -18,15 +18,21 @@
 
 set -uo pipefail
 
+# ── Paths (defined first so BUILD_SENTINEL can reference SCRIPT_DIR) ──────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Sentinel file written after a successful build so --skip-build is automatic
+BUILD_SENTINEL="$SCRIPT_DIR/.build_ok_bsds"
+
 # ── Defaults ──────────────────────────────────────────────────────────────────
 NODE_COUNTS=(2 4 6)
 THREAD_COUNTS=(1 2 4)
 SKIP_BUILD=0
 QUICK=0
-FIX=0               # --fix: wipe + redownload BSDS500 dataset
-VERIFY=0            # --verify: skip cluster/run, just regenerate report from existing log
+FIX=0
+VERIFY=0
 BSDS_N=10
-TIMEOUT_SECS=180    # per-run guard — BSDS images are larger than CIFAR/Tiny
+TIMEOUT_SECS=180
 
 # Container workspace root (fixed by docker-compose bind-mount)
 CONT_WS="/home/pi/workspace"
@@ -58,7 +64,6 @@ if [[ $QUICK -eq 1 ]]; then
 fi
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="$SCRIPT_DIR/report_bsds"
 LOG_FILE="$OUT_DIR/analysis_bsds.log"
 WS="$SCRIPT_DIR/workspace"
@@ -102,17 +107,30 @@ log "N images: $BSDS_N"
 log "Timeout : ${TIMEOUT_SECS}s per run"
 log "Out dir : $OUT_DIR"
 
-# ── Step 0: Docker check ──────────────────────────────────────────────────────
-section "STEP 0: Checking Docker"
+# ── Step 0: Docker + RAM check ────────────────────────────────────────────────
+section "STEP 0: Checking Docker and available RAM"
 command -v docker &>/dev/null || die "Docker not found on PATH"
 docker compose version &>/dev/null || docker-compose --version &>/dev/null || die "Docker Compose not found"
 command -v timeout &>/dev/null || { log "[WARN] 'timeout' not found — runs will not be time-limited"; TIMEOUT_SECS=0; }
 log "Docker OK"
 
+# Warn if free RAM is too low for the requested node count.
+# Each container has mem_limit: 1g so we need at least (MAX_NODES + 1) GB free.
+MAX_NODES="${NODE_COUNTS[-1]}"
+if command -v free &>/dev/null; then
+    FREE_MB=$(free -m | awk '/^Mem:/{print $7}')
+    NEEDED_MB=$(( (MAX_NODES + 1) * 1024 ))
+    log "RAM check: ${FREE_MB}MB free, ${NEEDED_MB}MB needed for ${MAX_NODES} nodes"
+    if [[ $FREE_MB -lt $NEEDED_MB ]]; then
+        log "[WARN] Low available RAM (${FREE_MB}MB < ${NEEDED_MB}MB)."
+        log "       Consider --nodes $(( MAX_NODES / 2 )) or closing other applications."
+        log "       Continuing anyway — expect swap-induced slowdowns."
+    fi
+else
+    log "[WARN] 'free' not found — skipping RAM check"
+fi
 
 # ── Cluster helpers ───────────────────────────────────────────────────────────
-MAX_NODES="${NODE_COUNTS[-1]}"
-
 master_running() {
     local status
     status=$(docker inspect --format '{{.State.Status}}' rpic_master 2>/dev/null)
@@ -148,12 +166,12 @@ ensure_cluster() {
     cd "$SCRIPT_DIR"
 
     if images_exist; then
-    docker compose \
-        --profile 2-nodes --profile 3-nodes --profile 4-nodes \
-        --profile 5-nodes --profile 6-nodes \
-        down --remove-orphans 2>&1 | tail -3 | tee -a "$LOG_FILE"
-    docker compose --profile "${n}-nodes" up -d \
-        2>&1 | tee -a "$LOG_FILE" || die "docker compose up failed"
+        docker compose \
+            --profile 2-nodes --profile 3-nodes --profile 4-nodes \
+            --profile 5-nodes --profile 6-nodes \
+            down --remove-orphans 2>&1 | tail -3 | tee -a "$LOG_FILE"
+        docker compose --profile "${n}-nodes" up -d \
+            2>&1 | tee -a "$LOG_FILE" || die "docker compose up failed"
     else
         log "  No images — building from scratch (~5-10 min first run)..."
         docker compose --profile "${n}-nodes" up -d --build \
@@ -233,23 +251,19 @@ docker exec -u pi rpic_master \
 # ── Step 2: BSDS500 dataset ───────────────────────────────────────────────────
 section "STEP 2: BSDS500 Dataset Management (--fix=$FIX)"
 
-# Wipe dataset if --fix requested
 if [[ $FIX -eq 1 ]]; then
     log "  [FIX] Removing BSDS500 dataset for redownload..."
     docker exec -u pi rpic_master rm -rf "$DS_ROOT/BSDS500" 2>/dev/null || true
 fi
 
-# ── Locate or download BSDS500 ────────────────────────────────────────────────
 BSDS_OK=0
 
-# Check primary expected layout first
 BSDS_DIR="$DS_ROOT/BSDS500/data/images/test"
 if docker exec -u pi rpic_master test -d "$BSDS_DIR" 2>/dev/null && \
    [[ $(docker exec -u pi rpic_master bash -c "find '$BSDS_DIR' -name '*.jpg' 2>/dev/null | wc -l") -gt 0 ]]; then
     log "  BSDS500 found at $BSDS_DIR"
     BSDS_OK=1
 else
-    # Search anywhere under DS_ROOT/BSDS500 for .jpg images
     FIRST=$(docker exec -u pi rpic_master bash -c \
         "find '$DS_ROOT/BSDS500' -name '*.jpg' 2>/dev/null | sort | head -1" 2>/dev/null || true)
     if [[ -n "$FIRST" ]]; then
@@ -280,7 +294,6 @@ PYEOF
         python3 /tmp/download_bsds.py
     " 2>&1 | tee -a "$LOG_FILE" && BSDS_OK=1 || die "BSDS500 download failed — cannot continue"
 
-    # Rediscover after download
     FIRST=$(docker exec -u pi rpic_master bash -c \
         "find '$DS_ROOT/BSDS500' -name '*.jpg' 2>/dev/null | sort | head -1" 2>/dev/null || true)
     if [[ -n "$FIRST" ]]; then
@@ -291,10 +304,7 @@ PYEOF
     fi
 fi
 
-# ── Derive BSDS_GT_DIR dynamically from wherever BSDS_DIR landed ──────────────
-# BSDS_DIR is e.g. .../BSDS500/data/images/test -> swap images -> groundTruth
 BSDS_GT_DIR="${BSDS_DIR/data\/images/data\/groundTruth}"
-# Fallback: search the tree for any groundTruth/test directory
 if ! docker exec -u pi rpic_master test -d "$BSDS_GT_DIR" 2>/dev/null; then
     FOUND_GT=$(docker exec -u pi rpic_master bash -c \
         "find '$DS_ROOT/BSDS500' -type d -name test | grep groundTruth | head -1" \
@@ -302,7 +312,6 @@ if ! docker exec -u pi rpic_master test -d "$BSDS_GT_DIR" 2>/dev/null; then
     [[ -n "$FOUND_GT" ]] && BSDS_GT_DIR="$FOUND_GT"
 fi
 
-# ── Build image list ───────────────────────────────────────────────────────────
 mkdir -p "$WS/results"
 BSDS_LIST_HOST="$WS/results/bsds_img_list.txt"
 BSDS_LIST_CONT="$CONT_WS/results/bsds_img_list.txt"
@@ -314,7 +323,6 @@ ACTUAL_N=$(wc -l < "$BSDS_LIST_HOST")
 [[ $ACTUAL_N -eq 0 ]] && die "BSDS image list is empty"
 log "  Image list: $ACTUAL_N images -> $BSDS_LIST_HOST"
 
-# ── Ground-truth availability ──────────────────────────────────────────────────
 GT_AVAILABLE=0
 if docker exec -u pi rpic_master test -d "$BSDS_GT_DIR" 2>/dev/null; then
     GT_AVAILABLE=1
@@ -323,7 +331,6 @@ else
     log "  [WARN] Ground-truth dir not found ($BSDS_GT_DIR) — quality metrics will be skipped"
 fi
 
-# Container-side output directories
 BSDS_OUT_CONT="/home/pi/workspace/results/bsds_out"
 for sub in sobel_arch1 sobel_arch2 sobel_arch3 sobel_arch4 \
            canny_arch1 canny_arch2 canny_arch3 canny_arch4 \
@@ -333,6 +340,16 @@ for sub in sobel_arch1 sobel_arch2 sobel_arch3 sobel_arch4 \
 done
 
 # ── Step 3: Build ─────────────────────────────────────────────────────────────
+# Auto-skip if a previous build succeeded and --fix was not given.
+# Shares the sentinel with run_analysis.sh via the same directory.
+# Use a separate sentinel name so the two scripts track independently.
+
+if [[ $SKIP_BUILD -eq 0 && $FIX -eq 0 && -f "$BUILD_SENTINEL" ]]; then
+    log "  [AUTO] Skipping build — sentinel present ($BUILD_SENTINEL)."
+    log "         Delete the sentinel or pass --fix to force a rebuild."
+    SKIP_BUILD=1
+fi
+
 if [[ $SKIP_BUILD -eq 0 ]]; then
     section "STEP 3: Building all architecture binaries"
     compile_binary "vision/shared/baselines"               "$BUILD/baselines"
@@ -353,8 +370,10 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
     compile_binary "vision/fft/fft_arch3_dist_dynamic"  "$BUILD/fft_arch3"
     compile_binary "vision/fft/fft_arch4_dist_pipeline" "$BUILD/fft_arch4"
     log "All binaries compiled into workspace/$BUILD/"
+    touch "$BUILD_SENTINEL"
 else
-    log "Skipping build (--skip-build)"
+    section "STEP 3: Build (skipped)"
+    log "  Using existing binaries in workspace/$BUILD/"
 fi
 
 # ── Step 4: Serial baselines ──────────────────────────────────────────────────
@@ -414,7 +433,6 @@ while IFS= read -r img; do
         runc "$n" "$BUILD/canny_arch3" "$img $BSDS_OUT_CONT/canny_arch3/canny_arch3_n${n}_${stem}.png"
     done
 done < "$BSDS_LIST_HOST"
-# Canny Arch4 — batch-only
 log "IMAGE: BSDS_BATCH_CANNY"
 docker exec -u pi rpic_master mkdir -p "$BSDS_OUT_CONT/canny_arch4" 2>/dev/null || true
 runc 4 "$BUILD/canny_arch4" "$BSDS_LIST_CONT $BSDS_OUT_CONT/canny_arch4 $ACTUAL_N"
@@ -440,7 +458,6 @@ done < "$BSDS_LIST_HOST"
 section "STEP 9: Copying reconstructed images to $OUT_DIR"
 mkdir -p "$OUT_DIR/reconstructed"
 if docker exec -u pi rpic_master test -d "$BSDS_OUT_CONT" 2>/dev/null; then
-    # Copy via tar to preserve directory structure
     docker exec -u pi rpic_master bash -c \
         "cd /home/pi/workspace/results && tar cf - bsds_out" \
         | tar xf - -C "$WS/results/" 2>/dev/null || true
@@ -450,12 +467,10 @@ else
     log "  [WARN] No reconstructed images found — bsds_out missing"
 fi
 
-# Copy original BSDS test images so Python can build side-by-side comparisons
 mkdir -p "$OUT_DIR/originals"
 if [[ -n "$BSDS_LIST_HOST" && -f "$BSDS_LIST_HOST" ]]; then
     while IFS= read -r orig_img; do
         cp_dest="$OUT_DIR/originals/$(basename "$orig_img")"
-        # Extract from container if not already on the host bind-mount
         docker exec -u pi rpic_master bash -c \
             "cat '$orig_img'" > "$cp_dest" 2>/dev/null || true
     done < "$BSDS_LIST_HOST"
@@ -470,13 +485,14 @@ section "STEP 10: Generating BSDS500 Report"
 GT_ARG=""
 if [[ $GT_AVAILABLE -eq 1 ]]; then
     mkdir -p "$WS/results/gt"
-    # Derive the relative path under BSDS500/data/ for the tar command
-    BSDS500_DATA_ROOT=$(docker exec -u pi rpic_master bash -c \
-        "echo '$BSDS_GT_DIR' | sed 's|/data/.*||')/data" 2>/dev/null || \
-        echo "$DS_ROOT/BSDS500/data"
+    # Strip everything from /data/ onward to get base, then append /data
+    _bsds_base=$(docker exec -u pi rpic_master bash -c \
+        "echo '$BSDS_GT_DIR' | sed 's|/data/.*||'" 2>/dev/null \
+        || echo "$DS_ROOT/BSDS500")
+    BSDS500_DATA_ROOT="${_bsds_base}/data"
     GT_REL=$(docker exec -u pi rpic_master bash -c \
-        "echo '$BSDS_GT_DIR' | sed 's|.*BSDS500/data/||'" 2>/dev/null || \
-        echo "groundTruth/test")
+        "echo '$BSDS_GT_DIR' | sed 's|.*BSDS500/data/||'" 2>/dev/null \
+        || echo "groundTruth/test")
     docker exec -u pi rpic_master bash -c \
         "cd '$BSDS500_DATA_ROOT' && tar cf - '$GT_REL'" \
         | tar xf - -C "$WS/results/gt/" 2>/dev/null || true
@@ -485,7 +501,11 @@ fi
 
 if command -v python3 &>/dev/null; then
     ORIG_ARG=""
-    [[ -d "$OUT_DIR/originals" ]] && orig_count=$(find "$OUT_DIR/originals" -maxdepth 1 \( -name "*.jpg" -o -name "*.png" \) 2>/dev/null | wc -l) && [[ $orig_count -gt 0 ]] && ORIG_ARG="--orig-dir $OUT_DIR/originals"
+    if [[ -d "$OUT_DIR/originals" ]]; then
+        orig_count=$(find "$OUT_DIR/originals" -maxdepth 1 \
+            \( -name "*.jpg" -o -name "*.png" \) 2>/dev/null | wc -l)
+        [[ $orig_count -gt 0 ]] && ORIG_ARG="--orig-dir $OUT_DIR/originals"
+    fi
     python3 "$SCRIPT_DIR/generate_report_bsds.py" \
         --log         "$LOG_FILE" \
         --outdir      "$OUT_DIR" \

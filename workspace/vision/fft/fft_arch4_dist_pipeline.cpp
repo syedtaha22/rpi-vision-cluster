@@ -16,6 +16,8 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
+    const char* out_path = (argc > 2) ? argv[argc-1] : "fft_arch4_out.png";
+
     if (size < 2) {
         if (rank == 0) cout << "Pipeline architecture requires at least 2 nodes.\n";
         MPI_Finalize();
@@ -107,7 +109,7 @@ int main(int argc, char** argv) {
             float mag = sqrt(data[i].real() * data[i].real() + data[i].imag() * data[i].imag());
             out[i] = (unsigned char)(255.0f * mag / max_edge);
         }
-        stbi_write_png("fft_arch4_out.png", nw, nh, 1, out.data(), nw);
+        stbi_write_png(out_path, nw, nh, 1, out.data(), nw);
     }
 
     MPI_Finalize();

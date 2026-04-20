@@ -15,6 +15,7 @@
 #    ./run_analysis.sh --nodes 2,4 --threads 1,4
 #    ./run_analysis.sh --image /path/to/img.png # skip dataset check, use this image
 #    ./run_analysis.sh --timeout 90             # per-run timeout (seconds)
+#    ./run_analysis.sh --with-coco              # include COCO-Val2017 (large, slow)
 # =============================================================================
 
 set -uo pipefail
@@ -25,9 +26,10 @@ THREAD_COUNTS=(1 2 4)
 SKIP_BUILD=0
 QUICK=0
 FIX=0
-VERIFY=0            # --verify: skip cluster/run, just regenerate report from existing log
+VERIFY=0
+WITH_COCO=0           # opt-in: --with-coco
 CUSTOM_IMAGE=""
-TIMEOUT_SECS=120    # per-run guard against blocking MPI calls
+TIMEOUT_SECS=120
 
 # Default per-dataset images (inside the container)
 CIFAR_IMG="/home/pi/workspace/vision/datasets/cifar-10/tabby_s_000074.png"
@@ -35,6 +37,11 @@ TINY_IMG="/home/pi/workspace/vision/datasets/tiny-imagenet-200/test/images/test_
 COCO_IMG="/home/pi/workspace/vision/datasets/coco-val2017/000000144003.jpg"
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Sentinel file written after a successful build so --skip-build is automatic
+BUILD_SENTINEL="$SCRIPT_DIR/.build_ok"
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --nodes)      IFS=',' read -ra NODE_COUNTS   <<< "$2"; shift 2 ;;
@@ -44,6 +51,7 @@ while [[ $# -gt 0 ]]; do
         --quick)      QUICK=1;                                 shift   ;;
         --verify)     VERIFY=1;                                shift   ;;
         --fix)        FIX=1;                                   shift   ;;
+        --with-coco)  WITH_COCO=1;                             shift   ;;
         --timeout)    TIMEOUT_SECS="$2";                       shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -54,12 +62,9 @@ if [[ $QUICK -eq 1 ]]; then
     THREAD_COUNTS=(1 2)
 fi
 
-# IMAGES array is built in Step 2 after dataset verification
-# (unless --image was given, in which case we skip dataset management)
 IMAGES=()
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="$SCRIPT_DIR/analysis_results.log"
 REPORT_DIR="$SCRIPT_DIR/report"
 WS="$SCRIPT_DIR/workspace"
@@ -68,7 +73,7 @@ DS_ROOT="/home/pi/workspace/vision/datasets"
 
 mkdir -p "$REPORT_DIR" "$WS/results/out"
 
-# ── Verify shortcut: just regenerate report from existing log ─────────────────
+# ── Verify shortcut ───────────────────────────────────────────────────────────
 if [[ $VERIFY -eq 1 ]]; then
     if [[ ! -f "$LOG_FILE" ]]; then
         echo "[VERIFY] No log found at $LOG_FILE — run without --verify first"
@@ -95,17 +100,32 @@ log "Started : $(date)"
 log "Nodes   : ${NODE_COUNTS[*]}"
 log "Threads : ${THREAD_COUNTS[*]}"
 log "Timeout : ${TIMEOUT_SECS}s per run"
+log "COCO    : $([ $WITH_COCO -eq 1 ] && echo enabled || echo disabled  -- use --with-coco to enable)"
 
-# ── Step 0: Docker check ──────────────────────────────────────────────────────
-section "STEP 0: Checking Docker"
+# ── Step 0: Docker + RAM check ────────────────────────────────────────────────
+section "STEP 0: Checking Docker and available RAM"
 command -v docker &>/dev/null || die "Docker not found on PATH"
 docker compose version &>/dev/null || docker-compose --version &>/dev/null || die "Docker Compose not found"
 command -v timeout &>/dev/null || { log "[WARN] 'timeout' not found — runs will not be time-limited"; TIMEOUT_SECS=0; }
 log "Docker OK"
 
-# ── Cluster helpers ───────────────────────────────────────────────────────────
+# Warn if free RAM is too low for the requested node count.
+# Each container has mem_limit: 1g so we need at least (MAX_NODES + 1) GB free.
 MAX_NODES="${NODE_COUNTS[-1]}"
+if command -v free &>/dev/null; then
+    FREE_MB=$(free -m | awk '/^Mem:/{print $7}')
+    NEEDED_MB=$(( (MAX_NODES + 1) * 1024 ))
+    log "RAM check: ${FREE_MB}MB free, ${NEEDED_MB}MB needed for ${MAX_NODES} nodes"
+    if [[ $FREE_MB -lt $NEEDED_MB ]]; then
+        log "[WARN] Low available RAM (${FREE_MB}MB < ${NEEDED_MB}MB)."
+        log "       Consider --nodes $(( MAX_NODES / 2 )) or closing other applications."
+        log "       Continuing anyway — expect swap-induced slowdowns."
+    fi
+else
+    log "[WARN] 'free' not found — skipping RAM check"
+fi
 
+# ── Cluster helpers ───────────────────────────────────────────────────────────
 master_running() {
     local status
     status=$(docker inspect --format '{{.State.Status}}' rpic_master 2>/dev/null)
@@ -141,12 +161,12 @@ ensure_cluster() {
     cd "$SCRIPT_DIR"
 
     if images_exist; then
-    docker compose \
-        --profile 2-nodes --profile 3-nodes --profile 4-nodes \
-        --profile 5-nodes --profile 6-nodes \
-        down --remove-orphans 2>&1 | tail -3 | tee -a "$LOG_FILE"
-    docker compose --profile "${n}-nodes" up -d \
-        2>&1 | tee -a "$LOG_FILE" || die "docker compose up failed"
+        docker compose \
+            --profile 2-nodes --profile 3-nodes --profile 4-nodes \
+            --profile 5-nodes --profile 6-nodes \
+            down --remove-orphans 2>&1 | tail -3 | tee -a "$LOG_FILE"
+        docker compose --profile "${n}-nodes" up -d \
+            2>&1 | tee -a "$LOG_FILE" || die "docker compose up failed"
     else
         log "  No images — building from scratch (first run ~5-10 min)..."
         docker compose --profile "${n}-nodes" up -d --build \
@@ -171,7 +191,6 @@ hostlist_for() {
 }
 
 # ── Run helper with timeout guard ─────────────────────────────────────────────
-# runc <nodes> <binary_rel_to_workspace> [args...]
 runc() {
     local nodes="$1" bin="$2"; shift 2
     local args="${*:-}"
@@ -227,9 +246,6 @@ docker exec -u pi rpic_master \
 # ── Step 2: Dataset management ───────────────────────────────────────────────
 section "STEP 2: Dataset management (--fix=$FIX)"
 
-## ensure_dataset <label> <dir_in_container> <find_pattern> <var_name>
-# Downloads dataset if absent (or wipes + redownloads if FIX=1).
-# Sets the named variable to the first discovered image path.
 ensure_dataset() {
     local label="$1" ds_dir="$2" pattern="$3" retvar="$4"
 
@@ -248,7 +264,6 @@ ensure_dataset() {
         log "  Downloading $label..."
         case "$label" in
             CIFAR-10)
-                # Write Python script to a temp file to avoid quoting issues
                 cat > /tmp/extract_cifar.py << 'PYEOF'
 import pickle, numpy as np, os, sys
 from PIL import Image
@@ -300,7 +315,6 @@ PYEOF
         esac
     fi
 
-    # Discover first image dynamically
     local img
     img=$(docker exec -u pi rpic_master bash -c \
         "find '$ds_dir' -name '$pattern' 2>/dev/null | sort | head -1" 2>/dev/null || true)
@@ -327,16 +341,36 @@ else
     if [[ -z "$TINY_IMG" ]]; then
         ensure_dataset "TinyImageNet" "$DS_ROOT/tiny-imagenet-200" "*.jpg"  TINY_IMG
     fi
-    ensure_dataset "COCO-Val2017" "$DS_ROOT/coco-val2017"      "*.jpg"  COCO_IMG
 
-    for img in "$CIFAR_IMG" "$TINY_IMG" "$COCO_IMG"; do
+    for img in "$CIFAR_IMG" "$TINY_IMG"; do
         [[ -n "$img" ]] && IMAGES+=("$img")
     done
+
+    # COCO is large (~6 GB download, slow to process) — opt-in only
+    if [[ $WITH_COCO -eq 1 ]]; then
+        ensure_dataset "COCO-Val2017" "$DS_ROOT/coco-val2017" "*.jpg" COCO_IMG
+        [[ -n "$COCO_IMG" ]] && IMAGES+=("$COCO_IMG")
+    else
+        log "  [SKIP] COCO-Val2017 skipped (pass --with-coco to enable)"
+    fi
+
     [[ ${#IMAGES[@]} -eq 0 ]] && die "No dataset images available — use --fix to redownload"
     log "  Running on ${#IMAGES[@]} image(s): ${IMAGES[*]}"
 fi
 
 # ── Step 3: Build all binaries ────────────────────────────────────────────────
+# Auto-skip if a previous build succeeded and --fix was not given.
+# A successful build writes a sentinel file; --fix or explicit --skip-build=0
+# forces a rebuild and refreshes the sentinel.
+
+BUILD_SENTINEL="$SCRIPT_DIR/.build_ok"
+
+if [[ $SKIP_BUILD -eq 0 && $FIX -eq 0 && -f "$BUILD_SENTINEL" ]]; then
+    log "  [AUTO] Skipping build — sentinel present ($BUILD_SENTINEL)."
+    log "         Delete the sentinel or pass --fix to force a rebuild."
+    SKIP_BUILD=1
+fi
+
 if [[ $SKIP_BUILD -eq 0 ]]; then
     section "STEP 3: Building all architecture binaries"
     compile_binary "vision/shared/baselines"               "$BUILD/baselines"
@@ -357,8 +391,11 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
     compile_binary "vision/fft/fft_arch3_dist_dynamic"  "$BUILD/fft_arch3"
     compile_binary "vision/fft/fft_arch4_dist_pipeline" "$BUILD/fft_arch4"
     log "All binaries compiled into workspace/$BUILD/"
+    # Mark build as done so next run skips automatically
+    touch "$BUILD_SENTINEL"
 else
-    log "Skipping build (--skip-build)"
+    section "STEP 3: Build (skipped)"
+    log "  Using existing binaries in workspace/$BUILD/"
 fi
 
 OUT_CONT="/home/pi/workspace/results/out"
@@ -371,7 +408,11 @@ for img in "${IMAGES[@]}"; do
     runc 1 "$BUILD/baselines" "$img"
 done
 
-# ── Per-image loop: runs all 4 archs for one filter ──────────────────────────
+# ── Per-filter runner ─────────────────────────────────────────────────────────
+# Binaries use original positional args: <img> <param> <output.png>
+# One mpirun per image keeps compatibility; the speed gains from earlier
+# changes (COCO opt-out, build sentinel, RAM check) still apply.
+
 run_filter_all() {
     local tag="$1" b1="$2" b2="$3" b3="$4" b4="$5"
 
@@ -388,13 +429,9 @@ run_filter_all() {
         # Arch2: OMP Pipeline  <img> <chunk_rows> <output.png>
         runc 1 "$b2" "$img 32 $OUT_CONT/${tag}_arch2_${stem}.png"
 
-        # Arch3: MPI Scatter  <img> <output.png>
+        # Arch3 / Arch4: MPI  <img> <output.png>
         for n in "${NODE_COUNTS[@]}"; do
             runc "$n" "$b3" "$img $OUT_CONT/${tag}_arch3_n${n}_${stem}.png"
-        done
-
-        # Arch4: MPI Pipeline  <img> <output.png>
-        for n in "${NODE_COUNTS[@]}"; do
             runc "$n" "$b4" "$img $OUT_CONT/${tag}_arch4_n${n}_${stem}.png"
         done
     done
@@ -416,7 +453,6 @@ for img in "${IMAGES[@]}"; do
     for n in "${NODE_COUNTS[@]}"; do
         runc "$n" "$BUILD/canny_arch3" "$img $OUT_CONT/canny_arch3_n${n}_${stem}.png"
     done
-    # Arch4 for Canny is batch-only; skip single-image mode
 done
 log "  [NOTE] Canny Arch4 (batch-only) → run run_analysis_bsds.sh for throughput"
 
