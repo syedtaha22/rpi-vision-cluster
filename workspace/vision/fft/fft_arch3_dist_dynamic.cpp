@@ -130,7 +130,7 @@ int main(int argc, char** argv) {
             float mag = sqrt(data[i].real() * data[i].real() + data[i].imag() * data[i].imag());
             out[i] = (unsigned char)(255.0f * mag / max_edge);
         }
-        stbi_write_png("out_path.png", new_w, new_h, 1, out.data(), new_w);
+        stbi_write_png(out_path, new_w, new_h, 1, out.data(), new_w);
     }
 
     MPI_Finalize();

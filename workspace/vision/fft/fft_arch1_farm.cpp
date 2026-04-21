@@ -15,7 +15,7 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    const char* out_path = (argc > 2) ? argv[argc-1] : "fft_arch3_out.png";
+    const char* out_path = (argc > 2) ? argv[argc-1] : "fft_arch1_out.png";
 
     int new_w = 0, new_h = 0, orig_w = 0, orig_h = 0;
     vector<Complex> data;

@@ -21,7 +21,7 @@ int main(int argc, char** argv) {
         cout << "Usage: " << argv[0] << " <image_path>\n";
         return 1;
     }
-    const char* out_path = (argc > 2) ? argv[argc-1] : "fft_arch3_out.png";
+    const char* out_path = (argc > 2) ? argv[argc-1] : "fft_arch2_out.png";
 
     omp_set_num_threads(2);
     
