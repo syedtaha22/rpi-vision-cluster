@@ -58,7 +58,7 @@ help:
 	@echo "  make setup NODES=4                         - Start cluster with 1 master + 3 workers"
 	@echo "  make compile FILE=matrix_multiply.c        - Compile C program in workspace/"
 	@echo "  make run FILE=matrix_multiply NODES=4      - Run compiled binary on 4 nodes"
-	@echo "  make run FILE=hello_cluster.py NODES=3     - Run Python script on 3 nodes"
+	@echo "  make run FILE=examples/hello_cluster.py NODES=3     - Run Python script on 3 nodes"
 	@echo ""
 
 # Check if Docker is installed
@@ -123,7 +123,7 @@ verify: status
 test:
 	@echo "Running MPI test ($(NODES) nodes)..."
 	@echo ""
-	docker exec -u pi rpic_master mpirun -n $(NODES) --host $(HOSTLIST) python3 /home/pi/workspace/hello_cluster.py
+	docker exec -u pi rpic_master mpirun -n $(NODES) --host $(HOSTLIST) python3 /home/pi/workspace/examples/hello_cluster.py
 	@echo ""
 
 # Open shell on master
@@ -157,6 +157,14 @@ clean-results:
 	@echo "Removing result images and lists from workspace/results/..."
 	rm -rf workspace/results/
 	@echo "Done — run any analysis script to regenerate"
+
+# Delete compiled binaries and build sentinel files
+clean-builds:
+	@echo "Removing compiled binaries and build sentinels..."
+	rm -rf workspace/build/*
+	rm -f analysis/.build_ok*
+	rm -f .build_ok*
+	@echo "Build artifacts removed."
 
 # Compile C/C++ in cluster (ARM64 with MPI)
 compile:

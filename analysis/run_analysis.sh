@@ -27,6 +27,7 @@ SKIP_BUILD=0
 QUICK=0
 FIX=0
 VERIFY=0
+NATIVE=0
 WITH_COCO=0           # opt-in: --with-coco
 CUSTOM_IMAGE=""
 TIMEOUT_SECS=120
@@ -50,6 +51,7 @@ while [[ $# -gt 0 ]]; do
         --skip-build) SKIP_BUILD=1;                            shift   ;;
         --quick)      QUICK=1;                                 shift   ;;
         --verify)     VERIFY=1;                                shift   ;;
+        --native)     NATIVE=1;                                shift   ;;
         --fix)        FIX=1;                                   shift   ;;
         --with-coco)  WITH_COCO=1;                             shift   ;;
         --timeout)    TIMEOUT_SECS="$2";                       shift 2 ;;
@@ -67,9 +69,12 @@ IMAGES=()
 # ── Paths ─────────────────────────────────────────────────────────────────────
 LOG_FILE="$SCRIPT_DIR/analysis_results.log"
 REPORT_DIR="$SCRIPT_DIR/report"
-WS="$SCRIPT_DIR/workspace"
+WS="$SCRIPT_DIR/../workspace"
 BUILD="build"
 DS_ROOT="/home/pi/workspace/vision/datasets"
+
+DOCKER_CMD="docker exec -u pi rpic_master"
+[[ $NATIVE -eq 1 ]] && DOCKER_CMD=""
 
 mkdir -p "$REPORT_DIR" "$WS/results/out"
 
@@ -103,9 +108,10 @@ log "Timeout : ${TIMEOUT_SECS}s per run"
 log "COCO    : $([ $WITH_COCO -eq 1 ] && echo enabled || echo disabled  -- use --with-coco to enable)"
 
 # ── Step 0: Docker + RAM check ────────────────────────────────────────────────
-section "STEP 0: Checking Docker and available RAM"
-command -v docker &>/dev/null || die "Docker not found on PATH"
-docker compose version &>/dev/null || docker-compose --version &>/dev/null || die "Docker Compose not found"
+if [[ $NATIVE -eq 0 ]]; then
+    section "STEP 0: Checking Docker and available RAM"
+    command -v docker &>/dev/null || die "Docker not found on PATH"
+    docker compose version &>/dev/null || docker-compose --version &>/dev/null || die "Docker Compose not found"
 command -v timeout &>/dev/null || { log "[WARN] 'timeout' not found — runs will not be time-limited"; TIMEOUT_SECS=0; }
 log "Docker OK"
 
@@ -133,10 +139,11 @@ master_running() {
 }
 
 master_healthy() {
-    docker exec -u pi rpic_master echo "ok" &>/dev/null
+    $DOCKER_CMD echo "ok" &>/dev/null
 }
 
 images_exist() {
+    if [[ $NATIVE -eq 1 ]]; then return 0; fi
     docker image inspect pdc_project-master &>/dev/null
 }
 
@@ -185,10 +192,32 @@ ensure_cluster() {
 }
 
 hostlist_for() {
-    local n="$1" hosts=(master)
-    for ((i=1; i<n; i++)); do hosts+=("worker$i"); done
-    local IFS=','; echo "${hosts[*]}"
+    local n="$1"
+    if [[ $NATIVE -eq 1 && -f "$SCRIPT_DIR/../rpi/config.env" ]]; then
+        source "$SCRIPT_DIR/../rpi/config.env"
+        local ALL_IPS=("$MASTER_IP" "$WORKER1_IP" "$WORKER2_IP" "$WORKER3_IP" "$WORKER4_IP" "$WORKER5_IP")
+        local hosts=()
+        for ((i=0; i<n; i++)); do hosts+=("${ALL_IPS[$i]}"); done
+        local IFS=','; echo "${hosts[*]}"
+    else
+        local hosts=(master)
+        for ((i=1; i<n; i++)); do hosts+=("worker$i"); done
+        local IFS=','; echo "${hosts[*]}"
+    fi
 }
+
+# ── Step 1: Start cluster ─────────────────────────────────────────────────────
+section "STEP 1: Starting cluster (${MAX_NODES} nodes)"
+cd "$SCRIPT_DIR"
+ensure_cluster
+
+log "Verifying MPI connectivity..."
+$DOCKER_CMD mpirun --allow-run-as-root -n "$MAX_NODES" \
+    --host "$(hostlist_for "$MAX_NODES")" hostname \
+    2>&1 | tee -a "$LOG_FILE" \
+    && log "Cluster verification: OK" \
+    || log "[WARN] Cluster verification failed — continuing anyway"
+fi
 
 # ── Run helper with timeout guard ─────────────────────────────────────────────
 runc() {
@@ -204,7 +233,7 @@ runc() {
 
     if [[ "${TIMEOUT_SECS:-0}" -gt 0 ]]; then
         timeout "$TIMEOUT_SECS" \
-            docker exec -u pi rpic_master bash -c "$cmd" \
+            ${DOCKER_CMD:-bash -c} "$cmd" \
             2>&1 | tee -a "$LOG_FILE"
         local ec=${PIPESTATUS[0]}
         if [[ $ec -eq 124 ]]; then
@@ -213,7 +242,7 @@ runc() {
             log "  [WARN] $bin exited $ec (continuing)"
         fi
     else
-        docker exec -u pi rpic_master bash -c "$cmd" \
+        ${DOCKER_CMD:-bash -c} "$cmd" \
             2>&1 | tee -a "$LOG_FILE" \
         || log "  [WARN] $bin exited non-zero (continuing)"
     fi
@@ -222,7 +251,7 @@ runc() {
 compile_binary() {
     local src_stem="$1" out_name="$2"
     log "  [COMPILE] $src_stem → $out_name"
-    docker exec -u pi rpic_master bash -c \
+         ${DOCKER_CMD:-bash -c} \
         "cd /home/pi/workspace && \
          mkdir -p \$(dirname $out_name) && \
          mpic++ -std=c++17 -O2 -fopenmp -I./vision/shared ${src_stem}.cpp -o ${out_name} -lm" \
@@ -230,26 +259,14 @@ compile_binary() {
     || log "  [WARN] Compile failed for $src_stem"
 }
 
-# ── Step 1: Start cluster ─────────────────────────────────────────────────────
-section "STEP 1: Starting cluster (${MAX_NODES} nodes)"
-cd "$SCRIPT_DIR"
-ensure_cluster
 
-log "Verifying MPI connectivity..."
-docker exec -u pi rpic_master \
-    mpirun --allow-run-as-root -n "$MAX_NODES" \
-    --host "$(hostlist_for "$MAX_NODES")" hostname \
-    2>&1 | tee -a "$LOG_FILE" \
-    && log "Cluster verification: OK" \
-    || log "[WARN] Cluster verification failed — continuing anyway"
 
 # ── Step 2: Dataset management ───────────────────────────────────────────────
 section "STEP 2: Dataset management (--fix=$FIX)"
 
 if [[ -n "$CUSTOM_IMAGE" ]]; then
-    log "  Custom image specified — skipping dataset management"
-    docker exec -u pi rpic_master test -f "$CUSTOM_IMAGE" 2>/dev/null \
-        || die "Custom image not found in container: $CUSTOM_IMAGE"
+    $DOCKER_CMD test -f "$CUSTOM_IMAGE" 2>/dev/null \
+        || die "Custom image not found: $CUSTOM_IMAGE"
     IMAGES=("$CUSTOM_IMAGE")
 else
     DL_FLAGS=""
@@ -257,11 +274,11 @@ else
     [[ $WITH_COCO -eq 1 ]] && DL_FLAGS="$DL_FLAGS --coco"
     
     log "  Running centralized dataset downloader..."
-    docker exec -u pi rpic_master bash /home/pi/workspace/vision/shared/download_datasets.sh $DL_FLAGS --cifar --tiny 2>&1 | tee -a "$LOG_FILE"
+    ${DOCKER_CMD:-bash} /home/pi/workspace/vision/shared/download_datasets.sh $DL_FLAGS --cifar --tiny 2>&1 | tee -a "$LOG_FILE"
     
-    CIFAR_IMG=$(docker exec -u pi rpic_master bash -c "find '$DS_ROOT/cifar-10' -name '*.jpg' -o -name '*.png' | head -1" 2>/dev/null || true)
-    TINY_IMG=$(docker exec -u pi rpic_master bash -c "find '$DS_ROOT/tiny-imagenet-200' -name '*.jpg' -o -name '*.JPEG' | head -1" 2>/dev/null || true)
-    COCO_IMG=$(docker exec -u pi rpic_master bash -c "find '$DS_ROOT/coco-val2017' -name '*.jpg' | head -1" 2>/dev/null || true)
+    CIFAR_IMG=$(${DOCKER_CMD:-bash} -c "find '$DS_ROOT/cifar-10' -name '*.jpg' -o -name '*.png' | head -1" 2>/dev/null || true)
+    TINY_IMG=$(${DOCKER_CMD:-bash} -c "find '$DS_ROOT/tiny-imagenet-200' -name '*.jpg' -o -name '*.JPEG' | head -1" 2>/dev/null || true)
+    COCO_IMG=$(${DOCKER_CMD:-bash} -c "find '$DS_ROOT/coco-val2017' -name '*.jpg' | head -1" 2>/dev/null || true)
     
     for img in "$CIFAR_IMG" "$TINY_IMG"; do
         [[ -n "$img" ]] && IMAGES+=("$img")
@@ -318,7 +335,7 @@ else
 fi
 
 OUT_CONT="/home/pi/workspace/results/out"
-docker exec -u pi rpic_master mkdir -p "$OUT_CONT" 2>/dev/null || true
+${DOCKER_CMD:-bash -c} "mkdir -p $OUT_CONT" 2>/dev/null || true
 
 # ── Step 4: Serial baselines ──────────────────────────────────────────────────
 section "STEP 4: Serial Baselines"

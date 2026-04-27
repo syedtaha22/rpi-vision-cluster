@@ -34,6 +34,7 @@ SKIP_BUILD=0
 QUICK=0
 FIX=0
 VERIFY=0
+NATIVE=0
 WITH_COCO=0           # opt-in: --with-coco enables COCO fallback download
 CUSTOM_IMAGE=""
 TIMEOUT_SECS=120
@@ -53,6 +54,7 @@ while [[ $# -gt 0 ]]; do
         --quick)      QUICK=1;                 shift   ;;
         --fix)        FIX=1;                   shift   ;;
         --verify)     VERIFY=1;                shift   ;;
+        --native)     NATIVE=1;                shift   ;;
         --with-coco)  WITH_COCO=1;             shift   ;;
         --timeout)    TIMEOUT_SECS="$2";       shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -64,8 +66,11 @@ done
 # ── Paths ─────────────────────────────────────────────────────────────────────
 OUT_DIR="$SCRIPT_DIR/report_resilience"
 LOG_FILE="$OUT_DIR/analysis_resilience.log"
-WS="$SCRIPT_DIR/workspace"
+WS="$SCRIPT_DIR/../workspace"
 BUILD="build"
+
+DOCKER_CMD="docker exec -u pi rpic_master"
+[[ $NATIVE -eq 1 ]] && DOCKER_CMD=""
 
 mkdir -p "$OUT_DIR" "$WS/results/resilience"
 
@@ -98,9 +103,10 @@ log "Out dir   : $OUT_DIR"
 log "COCO fallback: $([ $WITH_COCO -eq 1 ] && echo enabled || echo disabled -- use --with-coco to enable)"
 
 # ── Step 0: Docker + RAM check ────────────────────────────────────────────────
-section "STEP 0: Checking Docker and available RAM"
-command -v docker &>/dev/null || die "Docker not found on PATH"
-docker compose version &>/dev/null || docker-compose --version &>/dev/null || die "Docker Compose not found"
+if [[ $NATIVE -eq 0 ]]; then
+    section "STEP 0: Checking Docker and available RAM"
+    command -v docker &>/dev/null || die "Docker not found on PATH"
+    docker compose version &>/dev/null || docker-compose --version &>/dev/null || die "Docker Compose not found"
 command -v timeout &>/dev/null || { log "[WARN] 'timeout' not found — tests will not be time-limited"; TIMEOUT_SECS=0; }
 log "Docker OK"
 
@@ -177,10 +183,32 @@ ensure_cluster() {
 }
 
 hostlist_for() {
-    local n="$1" hosts=(master)
-    for ((i=1; i<n; i++)); do hosts+=("worker$i"); done
-    local IFS=','; echo "${hosts[*]}"
+    local n="$1"
+    if [[ $NATIVE -eq 1 && -f "$SCRIPT_DIR/../rpi/config.env" ]]; then
+        source "$SCRIPT_DIR/../rpi/config.env"
+        local ALL_IPS=("$MASTER_IP" "$WORKER1_IP" "$WORKER2_IP" "$WORKER3_IP" "$WORKER4_IP" "$WORKER5_IP")
+        local hosts=()
+        for ((i=0; i<n; i++)); do hosts+=("${ALL_IPS[$i]}"); done
+        local IFS=','; echo "${hosts[*]}"
+    else
+        local hosts=(master)
+        for ((i=1; i<n; i++)); do hosts+=("worker$i"); done
+        local IFS=','; echo "${hosts[*]}"
+    fi
 }
+
+# ── Step 1: Start cluster ─────────────────────────────────────────────────────
+section "STEP 1: Starting cluster (${RESILIENCE_NODES} nodes)"
+cd "$SCRIPT_DIR"
+ensure_cluster
+
+log "Verifying MPI connectivity..."
+$DOCKER_CMD mpirun --allow-run-as-root -n "$RESILIENCE_NODES" \
+    --host "$(hostlist_for "$RESILIENCE_NODES")" hostname \
+    2>&1 | tee -a "$LOG_FILE" \
+    && log "Cluster verification: OK" \
+    || log "[WARN] Cluster verification failed — continuing anyway"
+fi
 
 # ── Run helper with timeout guard ─────────────────────────────────────────────
 runc() {
@@ -196,7 +224,7 @@ runc() {
 
     if [[ "${TIMEOUT_SECS:-0}" -gt 0 ]]; then
         timeout "$TIMEOUT_SECS" \
-            docker exec -u pi rpic_master bash -c "$cmd" \
+            $DOCKER_CMD bash -c "$cmd" \
             2>&1 | tee -a "$LOG_FILE"
         local ec=${PIPESTATUS[0]}
         if [[ $ec -eq 124 ]]; then
@@ -205,7 +233,7 @@ runc() {
             log "  [WARN] $bin exited $ec (continuing)"
         fi
     else
-        docker exec -u pi rpic_master bash -c "$cmd" \
+        $DOCKER_CMD bash -c "$cmd" \
             2>&1 | tee -a "$LOG_FILE" \
         || log "  [WARN] $bin exited non-zero (continuing)"
     fi
@@ -214,7 +242,7 @@ runc() {
 compile_binary() {
     local src_stem="$1" out_name="$2"
     log "  [COMPILE] $src_stem → $out_name"
-    docker exec -u pi rpic_master bash -c \
+         $DOCKER_CMD bash -c \
         "cd /home/pi/workspace && \
          mkdir -p \$(dirname $out_name) && \
          mpic++ -std=c++17 -O2 -fopenmp -I./vision/shared ${src_stem}.cpp -o ${out_name} -lm" \
@@ -222,25 +250,14 @@ compile_binary() {
     || log "  [WARN] Compile failed for $src_stem"
 }
 
-# ── Step 1: Start cluster ─────────────────────────────────────────────────────
-section "STEP 1: Starting cluster ($RESILIENCE_NODES nodes)"
-cd "$SCRIPT_DIR"
-ensure_cluster
 
-log "Verifying MPI connectivity..."
-docker exec -u pi rpic_master \
-    mpirun --allow-run-as-root -n "$RESILIENCE_NODES" \
-    --host "$(hostlist_for "$RESILIENCE_NODES")" hostname \
-    2>&1 | tee -a "$LOG_FILE" \
-    && log "Cluster verification: OK" \
-    || log "[WARN] Cluster verification failed — continuing anyway"
 
 # ── Step 2: Select test image ─────────────────────────────────────────────────
 section "STEP 2: Dataset management + test image selection (--fix=$FIX)"
 RES_IMG=""
 
 if [[ -n "$CUSTOM_IMAGE" ]]; then
-    docker exec -u pi rpic_master test -f "$CUSTOM_IMAGE" 2>/dev/null \
+    $DOCKER_CMD test -f "$CUSTOM_IMAGE" 2>/dev/null \
         || die "Custom image not found in container: $CUSTOM_IMAGE"
     RES_IMG="$CUSTOM_IMAGE"
     log "  Using custom image: $RES_IMG"
@@ -251,10 +268,10 @@ else
     [[ $WITH_COCO -eq 1 ]] && DL_FLAGS="$DL_FLAGS --coco"
 
     log "  Running centralized dataset downloader..."
-    docker exec -u pi rpic_master bash /home/pi/workspace/vision/shared/download_datasets.sh $DL_FLAGS --bsds 1 2>&1 | tee -a "$LOG_FILE"
+    $DOCKER_CMD bash /home/pi/workspace/vision/shared/download_datasets.sh $DL_FLAGS --bsds 1 2>&1 | tee -a "$LOG_FILE"
 
     BSDS_DIR="$DS_ROOT/BSDS500/images"
-    RES_IMG=$(docker exec -u pi rpic_master bash -c \
+    RES_IMG=$($DOCKER_CMD bash -c \
         "find '$BSDS_DIR' -name '*.jpg' 2>/dev/null | sort | head -1" \
         2>/dev/null || true)
         
@@ -262,7 +279,7 @@ else
         log "  Using BSDS500 image: $RES_IMG"
     else
         log "  BSDS500 unavailable — trying COCO fallback (--with-coco)..."
-        COCO_IMG=$(docker exec -u pi rpic_master bash -c \
+        COCO_IMG=$($DOCKER_CMD bash -c \
             "find '$DS_ROOT/coco-val2017' -name '*.jpg' 2>/dev/null | sort | head -1" \
             2>/dev/null || true)
         if [[ -n "$COCO_IMG" ]]; then
@@ -297,7 +314,7 @@ else
 fi
 
 RES_CONT="/home/pi/workspace/results/resilience"
-docker exec -u pi rpic_master mkdir -p "$RES_CONT" 2>/dev/null || true
+$DOCKER_CMD mkdir -p "$RES_CONT" 2>/dev/null || true
 
 # ── Step 4: Serial baseline (for checksum reference) ─────────────────────────
 section "STEP 4: Serial baseline (checksum reference)"
@@ -363,11 +380,11 @@ if [[ $QUICK -eq 0 ]]; then
     done
 fi
 
-# ── Step 8: Copy resilience output images ─────────────────────────────────────
-section "STEP 8: Collecting output images"
+# ── Step 7: Copy reconstructed resilience images ──────────────────────────────
+section "STEP 7: Copying resilience results to $OUT_DIR"
 mkdir -p "$OUT_DIR/resilience_images"
-if docker exec -u pi rpic_master test -d "$RES_CONT" 2>/dev/null; then
-    docker exec -u pi rpic_master bash -c \
+if $DOCKER_CMD test -d "$RES_CONT" 2>/dev/null; then
+    $DOCKER_CMD bash -c \
         "cd /home/pi/workspace/results && tar cf - resilience" \
         | tar xf - -C "$WS/results/" 2>/dev/null || true
     cp -r "$WS/results/resilience/." "$OUT_DIR/resilience_images/" 2>/dev/null || true

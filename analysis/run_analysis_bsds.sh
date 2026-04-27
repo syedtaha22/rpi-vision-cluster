@@ -31,6 +31,7 @@ SKIP_BUILD=0
 QUICK=0
 FIX=0
 VERIFY=0
+NATIVE=0
 BSDS_N=10
 TIMEOUT_SECS=180
 
@@ -52,6 +53,7 @@ while [[ $# -gt 0 ]]; do
         --quick)      QUICK=1;                                 shift   ;;
         --fix)        FIX=1;                                   shift   ;;
         --verify)     VERIFY=1;                                shift   ;;
+        --native)     NATIVE=1;                                shift   ;;
         --timeout)    TIMEOUT_SECS="$2";                       shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -66,8 +68,11 @@ fi
 # ── Paths ─────────────────────────────────────────────────────────────────────
 OUT_DIR="$SCRIPT_DIR/report_bsds"
 LOG_FILE="$OUT_DIR/analysis_bsds.log"
-WS="$SCRIPT_DIR/workspace"
+WS="$SCRIPT_DIR/../workspace"
 BUILD="build"
+
+DOCKER_CMD="docker exec -u pi rpic_master"
+[[ $NATIVE -eq 1 ]] && DOCKER_CMD=""
 
 mkdir -p "$OUT_DIR"
 
@@ -108,9 +113,10 @@ log "Timeout : ${TIMEOUT_SECS}s per run"
 log "Out dir : $OUT_DIR"
 
 # ── Step 0: Docker + RAM check ────────────────────────────────────────────────
-section "STEP 0: Checking Docker and available RAM"
-command -v docker &>/dev/null || die "Docker not found on PATH"
-docker compose version &>/dev/null || docker-compose --version &>/dev/null || die "Docker Compose not found"
+if [[ $NATIVE -eq 0 ]]; then
+    section "STEP 0: Checking Docker and available RAM"
+    command -v docker &>/dev/null || die "Docker not found on PATH"
+    docker compose version &>/dev/null || docker-compose --version &>/dev/null || die "Docker Compose not found"
 command -v timeout &>/dev/null || { log "[WARN] 'timeout' not found — runs will not be time-limited"; TIMEOUT_SECS=0; }
 log "Docker OK"
 
@@ -138,7 +144,7 @@ master_running() {
 }
 
 master_healthy() {
-    docker exec -u pi rpic_master echo "ok" &>/dev/null
+    $DOCKER_CMD echo "ok" &>/dev/null
 }
 
 images_exist() {
@@ -190,10 +196,32 @@ ensure_cluster() {
 }
 
 hostlist_for() {
-    local n="$1" hosts=(master)
-    for ((i=1; i<n; i++)); do hosts+=("worker$i"); done
-    local IFS=','; echo "${hosts[*]}"
+    local n="$1"
+    if [[ $NATIVE -eq 1 && -f "$SCRIPT_DIR/../rpi/config.env" ]]; then
+        source "$SCRIPT_DIR/../rpi/config.env"
+        local ALL_IPS=("$MASTER_IP" "$WORKER1_IP" "$WORKER2_IP" "$WORKER3_IP" "$WORKER4_IP" "$WORKER5_IP")
+        local hosts=()
+        for ((i=0; i<n; i++)); do hosts+=("${ALL_IPS[$i]}"); done
+        local IFS=','; echo "${hosts[*]}"
+    else
+        local hosts=(master)
+        for ((i=1; i<n; i++)); do hosts+=("worker$i"); done
+        local IFS=','; echo "${hosts[*]}"
+    fi
 }
+
+# ── Step 1: Start cluster ─────────────────────────────────────────────────────
+section "STEP 1: Starting cluster (${MAX_NODES} nodes)"
+cd "$SCRIPT_DIR"
+ensure_cluster
+
+log "Verifying MPI connectivity..."
+$DOCKER_CMD mpirun --allow-run-as-root -n "$MAX_NODES" \
+    --host "$(hostlist_for "$MAX_NODES")" hostname \
+    2>&1 | tee -a "$LOG_FILE" \
+    && log "Cluster verification: OK" \
+    || log "[WARN] Cluster verification failed — continuing anyway"
+fi
 
 # ── Run helper with timeout guard ─────────────────────────────────────────────
 runc() {
@@ -209,7 +237,7 @@ runc() {
 
     if [[ "${TIMEOUT_SECS:-0}" -gt 0 ]]; then
         timeout "$TIMEOUT_SECS" \
-            docker exec -u pi rpic_master bash -c "$cmd" \
+            $DOCKER_CMD bash -c "$cmd" \
             2>&1 | tee -a "$LOG_FILE"
         local ec=${PIPESTATUS[0]}
         if [[ $ec -eq 124 ]]; then
@@ -218,7 +246,7 @@ runc() {
             log "  [WARN] $bin exited $ec (continuing)"
         fi
     else
-        docker exec -u pi rpic_master bash -c "$cmd" \
+        $DOCKER_CMD bash -c "$cmd" \
             2>&1 | tee -a "$LOG_FILE" \
         || log "  [WARN] $bin exited non-zero (continuing)"
     fi
@@ -227,7 +255,7 @@ runc() {
 compile_binary() {
     local src_stem="$1" out_name="$2"
     log "  [COMPILE] $src_stem → $out_name"
-    docker exec -u pi rpic_master bash -c \
+         ${DOCKER_CMD:-bash -c} \
         "cd /home/pi/workspace && \
          mkdir -p \$(dirname $out_name) && \
          mpic++ -std=c++17 -O2 -fopenmp -I./vision/shared ${src_stem}.cpp -o ${out_name} -lm" \
@@ -235,18 +263,7 @@ compile_binary() {
     || log "  [WARN] Compile failed for $src_stem"
 }
 
-# ── Step 1: Start cluster ─────────────────────────────────────────────────────
-section "STEP 1: Starting cluster (${MAX_NODES} nodes)"
-cd "$SCRIPT_DIR"
-ensure_cluster
 
-log "Verifying MPI connectivity..."
-docker exec -u pi rpic_master \
-    mpirun --allow-run-as-root -n "$MAX_NODES" \
-    --host "$(hostlist_for "$MAX_NODES")" hostname \
-    2>&1 | tee -a "$LOG_FILE" \
-    && log "Cluster verification: OK" \
-    || log "[WARN] Cluster verification failed — continuing anyway"
 
 # ── Step 2: BSDS500 dataset ───────────────────────────────────────────────────
 section "STEP 2: BSDS500 Dataset Management (--fix=$FIX)"
@@ -255,7 +272,7 @@ DL_FLAGS=""
 [[ $FIX -eq 1 ]] && DL_FLAGS="--fix"
 
 log "  Running centralized dataset downloader..."
-docker exec -u pi rpic_master bash /home/pi/workspace/vision/shared/download_datasets.sh $DL_FLAGS --bsds $BSDS_N 2>&1 | tee -a "$LOG_FILE"
+$DOCKER_CMD bash /home/pi/workspace/vision/shared/download_datasets.sh $DL_FLAGS --bsds $BSDS_N 2>&1 | tee -a "$LOG_FILE"
 
 BSDS_DIR="$DS_ROOT/BSDS500/images"
 BSDS_GT_DIR="$DS_ROOT/BSDS500/groundTruth_png"
@@ -264,7 +281,7 @@ mkdir -p "$WS/results"
 BSDS_LIST_HOST="$WS/results/bsds_img_list.txt"
 BSDS_LIST_CONT="$CONT_WS/results/bsds_img_list.txt"
 
-docker exec -u pi rpic_master bash -c \
+$DOCKER_CMD bash -c \
     "find '$BSDS_DIR' -name '*.jpg' | sort | head -${BSDS_N}" \
     > "$BSDS_LIST_HOST"
 ACTUAL_N=$(wc -l < "$BSDS_LIST_HOST")
@@ -272,7 +289,7 @@ ACTUAL_N=$(wc -l < "$BSDS_LIST_HOST")
 log "  Image list: $ACTUAL_N images -> $BSDS_LIST_HOST"
 
 GT_AVAILABLE=0
-if docker exec -u pi rpic_master test -d "$BSDS_GT_DIR" 2>/dev/null; then
+if $DOCKER_CMD test -d "$BSDS_GT_DIR" 2>/dev/null; then
     GT_AVAILABLE=1
     log "  Ground-truth directory found: $BSDS_GT_DIR"
 else
@@ -284,7 +301,7 @@ for sub in sobel_arch1 sobel_arch2 sobel_arch3 sobel_arch4 \
            canny_arch1 canny_arch2 canny_arch3 canny_arch4 \
            log_arch1  log_arch2  log_arch3  log_arch4  \
            fft_arch1  fft_arch2  fft_arch3  fft_arch4; do
-    docker exec -u pi rpic_master mkdir -p "$BSDS_OUT_CONT/$sub" 2>/dev/null || true
+    $DOCKER_CMD mkdir -p "$BSDS_OUT_CONT/$sub" 2>/dev/null || true
 done
 
 # ── Step 3: Build ─────────────────────────────────────────────────────────────
@@ -382,7 +399,7 @@ while IFS= read -r img; do
     done
 done < "$BSDS_LIST_HOST"
 log "IMAGE: BSDS_BATCH_CANNY"
-docker exec -u pi rpic_master mkdir -p "$BSDS_OUT_CONT/canny_arch4" 2>/dev/null || true
+$DOCKER_CMD mkdir -p "$BSDS_OUT_CONT/canny_arch4" 2>/dev/null || true
 runc 4 "$BUILD/canny_arch4" "$BSDS_LIST_CONT $BSDS_OUT_CONT/canny_arch4 $ACTUAL_N"
 
 section "STEP 7: LoG — All Architectures (BSDS500)"
@@ -405,8 +422,8 @@ done < "$BSDS_LIST_HOST"
 # ── Step 9: Copy reconstructed images ─────────────────────────────────────────
 section "STEP 9: Copying reconstructed images to $OUT_DIR"
 mkdir -p "$OUT_DIR/reconstructed"
-if docker exec -u pi rpic_master test -d "$BSDS_OUT_CONT" 2>/dev/null; then
-    docker exec -u pi rpic_master bash -c \
+if $DOCKER_CMD test -d "$BSDS_OUT_CONT" 2>/dev/null; then
+    $DOCKER_CMD bash -c \
         "cd /home/pi/workspace/results && tar cf - bsds_out" \
         | tar xf - -C "$WS/results/" 2>/dev/null || true
     cp -r "$WS/results/bsds_out/." "$OUT_DIR/reconstructed/" 2>/dev/null || true
@@ -419,7 +436,7 @@ mkdir -p "$OUT_DIR/originals"
 if [[ -n "$BSDS_LIST_HOST" && -f "$BSDS_LIST_HOST" ]]; then
     while IFS= read -r orig_img; do
         cp_dest="$OUT_DIR/originals/$(basename "$orig_img")"
-        docker exec -u pi rpic_master bash -c \
+        $DOCKER_CMD bash -c \
             "cat '$orig_img'" > "$cp_dest" 2>/dev/null || true
     done < "$BSDS_LIST_HOST"
     orig_count=$(find "$OUT_DIR/originals" -name "*.jpg" -o -name "*.png" 2>/dev/null | wc -l)
@@ -432,8 +449,7 @@ fi
 section "STEP 10: Generating BSDS500 Report"
 GT_ARG=""
 if [[ $GT_AVAILABLE -eq 1 ]]; then
-    mkdir -p "$WS/results/gt"
-    docker exec -u pi rpic_master bash -c \
+    $DOCKER_CMD bash -c \
         "cd '$DS_ROOT/BSDS500' && tar cf - groundTruth_png" \
         | tar xf - -C "$WS/results/gt/" 2>/dev/null || true
     GT_ARG="--gt-dir $WS/results/gt/groundTruth_png"
