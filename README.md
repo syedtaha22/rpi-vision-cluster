@@ -26,9 +26,22 @@ rpi-vision-cluster/
 ├── resilience_analysis.sh            # Benchmark: fault tolerance & bully election
 ├── generate_report.py                # Performance report generator
 ├── generate_report_bsds.py           # BSDS500 report generator
-└── generate_report_resilience.py     # Resilience report generator
-
-workspace/                            # Mounted into every container at /home/pi/workspace/
+├── generate_report_resilience.py     # Resilience report generator
+│
+├── rpi/                              # Physical cluster deployment & management
+│   ├── config.env                    # Cluster IPs & credentials (gitignored)
+│   ├── setup_cluster.sh              # Dependency & SSH provisioning
+│   ├── deploy.sh                     # Compilation & binary distribution
+│   ├── sync_images.sh                # Dataset syncing to nodes
+│   ├── run_game.sh                   # Interactive MPI smoke test
+│   └── verify.sh                     # Cluster health & diagnostics
+│
+├── _dev/                             # Development tools & scratchpad (not pushed)
+│   ├── rough_plots.py                # Visual style guide reference
+│   ├── game.cpp, play_game.sh        # Number guessing game code
+│   └── workspace_to_md.py            # Utility scripts
+│
+└── workspace/                        # Mounted into every container at /home/pi/workspace/
 ├── hello_cluster.py                  # MPI connectivity test
 ├── plot.ipynb                        # Benchmark result visualisation notebook
 ├── run_bsds500_all.sh                # Full BSDS500 run (all filters x all archs)

@@ -42,25 +42,23 @@ try:
 except ImportError:
     HAS_PIL = False
 
-# ── Shared style ──────────────────────────────────────────────────────────────
+# ── Shared style — matches rough_plots.py ────────────────────────────────────
 STYLE = {
-    "font.family":       "DejaVu Sans",
-    "font.size":         10,
-    "axes.titlesize":    11,
-    "axes.titleweight":  "bold",
-    "axes.labelsize":    10,
-    "xtick.labelsize":   9,
-    "ytick.labelsize":   9,
-    "legend.fontsize":   8,
-    "legend.framealpha": 0.7,
-    "axes.grid":         True,
-    "grid.alpha":        0.3,
-    "grid.linestyle":    "--",
-    "axes.spines.top":   False,
-    "axes.spines.right": False,
-    "figure.dpi":        150,
-    "savefig.dpi":       150,
-    "savefig.bbox":      "tight",
+    "font.family":        "serif",
+    "font.size":          11,
+    "axes.titlesize":     12,
+    "axes.labelsize":     11,
+    "xtick.labelsize":    9,
+    "ytick.labelsize":    9,
+    "legend.fontsize":    9,
+    "legend.framealpha":  0.85,
+    "legend.edgecolor":   "#cccccc",
+    "axes.grid":          False,
+    "axes.spines.top":    False,
+    "axes.spines.right":  False,
+    "figure.dpi":         150,
+    "savefig.dpi":        150,
+    "savefig.bbox":       "tight",
 }
 plt.rcParams.update(STYLE)
 
@@ -76,10 +74,16 @@ ARCH_LABELS_SHORT = {1: "Arch1 (OMP Farm)", 2: "Arch2 (OMP Pipeline)",
                       3: "Arch3 (MPI Scatter)", 4: "Arch4 (MPI Pipeline)"}
 ARCH_PAR = {1: "threads", 2: "threads", 3: "nodes", 4: "nodes"}
 
-# Color palette consistent with the PDF report
-ARCH_COLORS   = ["#2196F3", "#4CAF50", "#FF5722", "#9C27B0"]
-FILTER_COLORS = {"Sobel": "#2196F3", "Canny": "#F44336",
-                 "LoG": "#4CAF50", "FFT": "#FF9800"}
+# Colourblind-safe palette — same as rough_plots.py
+C = ['#2c7bb6',   # blue   – Arch1 / Sobel
+     '#d7191c',   # red    – Arch2 / Canny
+     '#1a9641',   # green  – Arch3 / LoG
+     '#fd8d3c',   # orange – Arch4 / FFT
+     '#756bb1',   # purple
+     '#636363']   # grey
+
+ARCH_COLORS   = C[:4]
+FILTER_COLORS = {"Sobel": C[0], "Canny": C[1], "LoG": C[2], "FFT": C[3]}
 
 # Image size labels
 SIZE_LABELS = {

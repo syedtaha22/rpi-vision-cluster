@@ -39,27 +39,33 @@ except ImportError:
     HAS_PIL = False
     print("[WARN] Pillow not installed — image panels will be skipped")
 
-# ── Shared style ──────────────────────────────────────────────────────────────
+# ── Shared style — matches rough_plots.py ────────────────────────────────────
 STYLE = {
-    "font.family":       "DejaVu Sans",
-    "font.size":         10,
-    "axes.titlesize":    11,
-    "axes.titleweight":  "bold",
-    "axes.labelsize":    10,
-    "xtick.labelsize":   9,
-    "ytick.labelsize":   9,
-    "legend.fontsize":   8,
-    "legend.framealpha": 0.7,
-    "axes.grid":         True,
-    "grid.alpha":        0.3,
-    "grid.linestyle":    "--",
-    "axes.spines.top":   False,
-    "axes.spines.right": False,
-    "figure.dpi":        150,
-    "savefig.dpi":       150,
-    "savefig.bbox":      "tight",
+    "font.family":        "serif",
+    "font.size":          11,
+    "axes.titlesize":     12,
+    "axes.labelsize":     11,
+    "xtick.labelsize":    9,
+    "ytick.labelsize":    9,
+    "legend.fontsize":    9,
+    "legend.framealpha":  0.85,
+    "legend.edgecolor":   "#cccccc",
+    "axes.grid":          False,
+    "axes.spines.top":    False,
+    "axes.spines.right":  False,
+    "figure.dpi":         150,
+    "savefig.dpi":        150,
+    "savefig.bbox":       "tight",
 }
 plt.rcParams.update(STYLE)
+
+# Colourblind-safe palette — same as rough_plots.py
+C = ['#2c7bb6',   # blue
+     '#d7191c',   # red
+     '#1a9641',   # green
+     '#fd8d3c',   # orange
+     '#756bb1',   # purple
+     '#636363']   # grey
 
 # ── Log patterns ──────────────────────────────────────────────────────────────
 RESILIENCE_PATTERNS = {
@@ -193,7 +199,7 @@ def _annotate_bars(ax, bars, values, fmt="{:.1f} ms", pad_frac=0.02):
 # ── Figure 1: Recovery times bar chart ───────────────────────────────────────
 def fig1_recovery_times(res, nodes, outdir):
     labels, values, colors = [], [], []
-    color_map = {1: "#E53935", 2: "#FB8C00", 3: "#8E24AA"}
+    color_map = {1: C[1], 2: C[3], 3: C[4]}
 
     for test_id, label in [
         (1, "Test 1\nWorker Crash\nRecovery"),
@@ -297,7 +303,7 @@ def fig3_bully_election(scenarios, outdir):
     rnd_stds  = [np.std([r['rounds'] for r in s['ranks']]) if len(s['ranks']) > 1 else 0
                  for s in scenarios]
 
-    bar_colors = ["#2196F3", "#FF5722", "#9C27B0"][:len(scenarios)]
+    bar_colors = C[:len(scenarios)]
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     fig.suptitle("Bully Algorithm Leader Election — Performance Summary")
@@ -409,7 +415,7 @@ def fig5_resilience_images(resilience_dir, outdir):
                  "(output should match serial reference with minor boundary differences)",
                  fontsize=11, fontweight="bold")
 
-    test_colors = ["#E53935", "#FB8C00", "#8E24AA", "#0288D1"]
+    test_colors = [C[1], C[3], C[4], C[0]]
     for ax, (fpath, lbl), color in zip(axes, valid, test_colors):
         try:
             img = PILImage.open(fpath).convert("L")

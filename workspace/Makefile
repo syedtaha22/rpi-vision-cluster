@@ -1,4 +1,4 @@
-.PHONY: all clean detector vision help
+.PHONY: all clean detector vision mat_to_png help
 
 # ── Compiler flags ────────────────────────────────────────────────────────────
 CXX      := g++
@@ -25,6 +25,7 @@ ARCH2_OMP  := sobel_arch2 log_arch2 canny_arch2 fft_arch2
 ARCH3_MPI  := sobel_arch3 log_arch3 canny_arch3 fft_arch3
 ARCH4_MPI  := sobel_arch4 log_arch4 canny_arch4 fft_arch4
 EXTRA_MPI  := bully_election resilience_test
+MAT_TO_PNG := mat_to_png
 
 # ── Default ───────────────────────────────────────────────────────────────────
 all: $(TEST_BIN)
@@ -97,6 +98,18 @@ vision:
 	# ── Shared: Baselines ─────────────────────────────────────────────────
 	$(MPICXX) $(MPICXXFLAGS) $(VISION)/shared/baselines.cpp                     -o $(BUILD_DIR)/baselines        -lm
 	@echo "All architecture binaries built in ./build/"
+
+# ── mat_to_png: BSD500 .mat → PNG ground truth converter ─────────────────────
+# Standalone tool (no MPI needed), used before running metrics evaluation.
+# Converts BSDS500 .mat boundary annotations → binary PNG edge masks.
+# Used with metrics.h for Jaccard / Dice / SSIM evaluation.
+mat_to_png:
+	@mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I$(VISION)/shared \
+		$(VISION)/shared/mat_to_png.cpp \
+		-o $(BUILD_DIR)/mat_to_png -lm -lstdc++fs
+	@echo "Built: ./build/mat_to_png"
+	@echo "Usage: ./build/mat_to_png --batch vision/datasets/BSDS500/ground_truth/test/ /tmp/bsd_gt_png/"
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 clean:

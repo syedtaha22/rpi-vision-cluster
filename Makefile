@@ -1,4 +1,5 @@
-.PHONY: help setup start stop restart clean clean-results verify test logs shell destroy compile run
+.PHONY: help setup start stop restart clean clean-results verify test logs shell destroy compile run \
+        rpi-setup rpi-deploy rpi-verify rpi-run rpi-game rpi-teardown rpi-teardown-full rpi-sync rpi-help
 
 # Configuration
 NODES ?= 2
@@ -192,3 +193,85 @@ run:
 		docker exec -u pi rpic_master bash -c "cd /home/pi/workspace && mpirun -n $(NODES) --host $(HOSTLIST) /home/pi/workspace/$(FILE) $(ARGS)"; \
 	fi
 	@echo ""
+
+# =============================================================================
+# RPI Real-Hardware Targets
+# =============================================================================
+# These targets delegate to the rpi/ shell scripts which manage the actual
+# Raspberry Pi cluster. All configuration lives in rpi/config.env (gitignored).
+# Run 'make rpi-help' for usage, or 'make rpi-setup' to get started.
+#
+# Environment isolation:
+#   - Docker targets (above) use openmpi via the Dockerfile.cluster image.
+#   - RPI targets install openmpi-bin + libopenmpi-dev directly on each Pi.
+#   - Binaries are ALWAYS compiled on the target platform; never shared.
+# =============================================================================
+
+RPI_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))rpi
+
+rpi-help:
+	@echo ""
+	@echo "RPI Cluster — Real Hardware Targets"
+	@echo ""
+	@echo "  Setup:"
+	@echo "    make rpi-setup             One-time cluster setup (install packages, SSH keys, hostfile)"
+	@echo ""
+	@echo "  Deploy:"
+	@echo "    make rpi-deploy            Sync workspace/ + compile all 18 binaries on cluster"
+	@echo "    make rpi-deploy SKIP=sync  Skip rsync, recompile only"
+	@echo ""
+	@echo "  Run:"
+	@echo "    make rpi-run FILTER=sobel ARCH=3 NODES=6 IMAGE=path/to/img.jpg"
+	@echo "    make rpi-run FILTER=fft   ARCH=4 NODES=4 IMAGE=path/to/img.jpg"
+	@echo "    make rpi-game              MPI number game (smoke test, 3 nodes)"
+	@echo ""
+	@echo "  Verify / Cleanup:"
+	@echo "    make rpi-verify            Full health check (SSH + mpich + binaries + MPI test)"
+	@echo "    make rpi-teardown          Clean /tmp artefacts from all nodes"
+	@echo "    make rpi-teardown-full     Also wipe ~/workspace/build/ (requires redeploy)"
+	@echo ""
+	@echo "  Images (scp from laptop, no internet needed on Pis):"
+	@echo "    make rpi-sync              Copy BSD(20)+COCO+CIFAR+TinyIN images to all nodes"
+	@echo "    make rpi-sync BSD_COUNT=50 Copy up to 50 BSD images"
+	@echo ""
+	@echo "  Filters : sobel | canny | log | fft"
+	@echo "  Archs   : 1 (OMP Farm) | 2 (OMP Pipeline) | 3 (MPI Scatter) | 4 (MPI Pipeline)"
+	@echo "  Nodes   : 2 – 6"
+	@echo ""
+	@echo "  Config  : rpi/config.env (copy from rpi/config.env.template, never committed)"
+	@echo ""
+
+rpi-setup:
+	@echo "Running RPI cluster setup..."
+	@bash $(RPI_DIR)/setup_cluster.sh
+
+rpi-deploy:
+	@if [ "$(SKIP)" = "sync" ]; then \
+		bash $(RPI_DIR)/deploy.sh --skip-sync; \
+	else \
+		bash $(RPI_DIR)/deploy.sh; \
+	fi
+
+rpi-run:
+	@if [ -z "$(FILTER)" ] || [ -z "$(ARCH)" ] || [ -z "$(NODES)" ] || [ -z "$(IMAGE)" ]; then \
+		echo "Usage: make rpi-run FILTER=<sobel|canny|log|fft> ARCH=<1-4> NODES=<2-6> IMAGE=<path>"; \
+		exit 1; \
+	fi
+	@bash $(RPI_DIR)/run_vision.sh \
+		--filter $(FILTER) --arch $(ARCH) --nodes $(NODES) --image $(IMAGE) \
+		$(if $(OUTPUT_DIR),--output-dir $(OUTPUT_DIR),)
+
+rpi-game:
+	@bash $(RPI_DIR)/run_game.sh
+
+rpi-verify:
+	@bash $(RPI_DIR)/verify.sh
+
+rpi-teardown:
+	@bash $(RPI_DIR)/teardown.sh
+
+rpi-teardown-full:
+	@bash $(RPI_DIR)/teardown.sh --full
+
+rpi-sync:
+	@bash $(RPI_DIR)/sync_images.sh $(if $(BSD_COUNT),--bsd-count $(BSD_COUNT),)
