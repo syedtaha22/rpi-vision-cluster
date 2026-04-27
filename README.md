@@ -117,6 +117,41 @@ make clean-results   # deletes reports/, logs, workspace/results/ — keeps comp
 
 ---
 
+## Physical RPi Cluster (Native Mode)
+
+You can run the analysis benchmarks directly on your physical Raspberry Pi cluster instead of using local Docker emulation.
+
+### One-Time Setup
+Before running benchmarks or games on the physical cluster, you must perform the following one-time setup:
+1. Ensure your laptop is on the same network as the Pis (e.g., via mobile hotspot).
+2. Run the cluster setup script. This will auto-discover the IPs of your Pis and generate a `rpi/config.env` file. It will also ensure necessary tools like `rsync` are installed on the Pis.
+   ```bash
+   ./rpi/setup_cluster.sh
+   ```
+   *Note: By default, the deployment uses `~/Desktop/rpi-vision-cluster/workspace` as the base directory on all your Raspberry Pis. If you'd like to use a different folder (for example, keeping it directly in `~/workspace`), simply open `rpi/config.env` after generating it and edit the `RPI_WS_PARENT` and `RPI_WORKSPACE_DIR` variables before running the benchmarks.*
+
+### Per-Run Usage (Benchmarks)
+All analysis scripts support a `--native` flag. When provided, the script will:
+1. Automatically compile and deploy the binaries to the master Pi (`rpi/deploy.sh`).
+2. Sync required datasets from your laptop to the master Pi.
+3. Run the benchmarks natively via SSH.
+4. Pull the results back to your laptop to generate the PDF/HTML reports locally.
+
+```bash
+./analysis/run_analysis.sh --native
+./analysis/run_analysis_bsds.sh --native
+./analysis/resilience_analysis.sh --native
+```
+
+### Interactive Game Simulation
+To run the interactive MPI number guessing game natively:
+```bash
+./rpi/deploy.sh     # (Optional) Run once if you haven't deployed the binaries yet
+./rpi/run_game.sh   # Run the interactive game
+```
+
+---
+
 ## Dataset Management
 
 All three analysis scripts share the same download-once / reuse pattern:
@@ -153,13 +188,14 @@ pre-download everything in one shot before running any analysis.
 Tests all 4 algorithms x 4 architectures on three image sizes (32px, 64px, ~1MP).
 
 ```bash
-./run_analysis.sh                          # full run, defaults
-./run_analysis.sh --quick                  # 1 image, fewer node/thread configs
-./run_analysis.sh --fix                    # redownload all datasets first
-./run_analysis.sh --skip-build             # skip recompilation
-./run_analysis.sh --nodes 2,4 --threads 1,4
-./run_analysis.sh --image /path/to/img.png # use a specific image, skip dataset check
-./run_analysis.sh --timeout 90             # per-run timeout in seconds
+./analysis/run_analysis.sh                          # full run, defaults (Docker)
+./analysis/run_analysis.sh --native                 # run natively on physical RPi cluster
+./analysis/run_analysis.sh --quick                  # 1 image, fewer node/thread configs
+./analysis/run_analysis.sh --fix                    # redownload all datasets first
+./analysis/run_analysis.sh --skip-build             # skip recompilation
+./analysis/run_analysis.sh --nodes 2,4 --threads 1,4
+./analysis/run_analysis.sh --image /path/to/img.png # use a specific image, skip dataset check
+./analysis/run_analysis.sh --timeout 90             # per-run timeout in seconds
 ```
 
 Output: `report/` directory + `analysis_results.log`
@@ -170,13 +206,14 @@ Tests all 4 algorithms x 4 architectures on BSDS500 test images with SSIM/Dice/J
 against ground-truth edge maps.
 
 ```bash
-./run_analysis_bsds.sh                     # defaults (10 images)
-./run_analysis_bsds.sh --n-images 50
-./run_analysis_bsds.sh --quick             # 3 images, fewer configs
-./run_analysis_bsds.sh --fix               # redownload BSDS500 first
-./run_analysis_bsds.sh --skip-build
-./run_analysis_bsds.sh --nodes 2,4 --threads 1,4
-./run_analysis_bsds.sh --timeout 180
+./analysis/run_analysis_bsds.sh                     # defaults (10 images, Docker)
+./analysis/run_analysis_bsds.sh --native            # run natively on physical RPi cluster
+./analysis/run_analysis_bsds.sh --n-images 50
+./analysis/run_analysis_bsds.sh --quick             # 3 images, fewer configs
+./analysis/run_analysis_bsds.sh --fix               # redownload BSDS500 first
+./analysis/run_analysis_bsds.sh --skip-build
+./analysis/run_analysis_bsds.sh --nodes 2,4 --threads 1,4
+./analysis/run_analysis_bsds.sh --timeout 180
 ```
 
 Output: `report_bsds/` directory + `report_bsds/analysis_bsds.log`
@@ -187,12 +224,13 @@ Runs four resilience scenarios (worker crash, slow node, coordinator recovery, p
 and three bully election scenarios.
 
 ```bash
-./resilience_analysis.sh                   # defaults (6 nodes)
-./resilience_analysis.sh --nodes 4         # min 3 required
-./resilience_analysis.sh --quick
-./resilience_analysis.sh --fix             # redownload BSDS500/COCO first
-./resilience_analysis.sh --image /path     # use a specific image
-./resilience_analysis.sh --timeout 120
+./analysis/resilience_analysis.sh                   # defaults (6 nodes, Docker)
+./analysis/resilience_analysis.sh --native          # run natively on physical RPi cluster
+./analysis/resilience_analysis.sh --nodes 4         # min 3 required
+./analysis/resilience_analysis.sh --quick
+./analysis/resilience_analysis.sh --fix             # redownload BSDS500/COCO first
+./analysis/resilience_analysis.sh --image /path     # use a specific image
+./analysis/resilience_analysis.sh --timeout 120
 ```
 
 Output: `report_resilience/` directory + `report_resilience/analysis_resilience.log`
@@ -285,19 +323,19 @@ Parameters: `NODES=N` (2-6), `FILE=path`, `OUTPUT=name`, `ARGS="..."`
 
 **Dataset missing / corrupt data:**
 ```bash
-./run_analysis.sh       --fix
-./run_analysis_bsds.sh  --fix
-./resilience_analysis.sh --fix
+./analysis/run_analysis.sh       --fix
+./analysis/run_analysis_bsds.sh  --fix
+./analysis/resilience_analysis.sh --fix
 ```
 
 **Ground-truth metrics skipped:** The BSDS500 download from Kaggle always includes ground-truth
 `.mat` files. If this warning appears it usually means the download was interrupted. Run
-`./run_analysis_bsds.sh --fix` to redownload.
+`./analysis/run_analysis_bsds.sh --fix` to redownload.
 
 **Stale reports from a previous run:**
 ```bash
 make clean-results
-./run_analysis_bsds.sh    # regenerates from scratch
+./analysis/run_analysis_bsds.sh    # regenerates from scratch
 ```
 
 **ARM64 emulation not working:**

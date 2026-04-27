@@ -68,11 +68,28 @@ OUT_DIR="$SCRIPT_DIR/report_resilience"
 LOG_FILE="$OUT_DIR/analysis_resilience.log"
 WS="$SCRIPT_DIR/../workspace"
 BUILD="build"
+DS_ROOT="$CONT_WS/vision/datasets"
+[[ $NATIVE -eq 1 ]] && DS_ROOT="$WS/vision/datasets"
 
-DOCKER_CMD="docker exec -u pi rpic_master"
-[[ $NATIVE -eq 1 ]] && DOCKER_CMD=""
+# EXEC_PREFIX: Docker mode = docker exec; Native mode = ssh to master Pi
+EXEC_PREFIX="docker exec -u pi rpic_master"
+if [[ $NATIVE -eq 1 ]]; then
+    RPI_CONFIG="$SCRIPT_DIR/../rpi/config.env"
+    if [[ ! -f "$RPI_CONFIG" ]] || grep -q "__FILL_IN__" "$RPI_CONFIG" 2>/dev/null; then
+        echo "  config.env missing — running gen_config.sh..."
+        bash "$SCRIPT_DIR/../rpi/gen_config.sh" \
+            || { echo "[FATAL] gen_config.sh failed"; exit 1; }
+    fi
+    source "$RPI_CONFIG"
+    NATIVE_WS=$(ssh "${MASTER_USER}@${MASTER_IP}" "echo ${RPI_WORKSPACE_DIR}" 2>/dev/null) \
+        || { echo "[FATAL] Cannot SSH to ${MASTER_USER}@${MASTER_IP}"; exit 1; }
+    CONT_WS="$NATIVE_WS"
+    DS_ROOT="$NATIVE_WS/vision/datasets"
+    EXEC_PREFIX="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new ${MASTER_USER}@${MASTER_IP}"
+fi
 
 mkdir -p "$OUT_DIR" "$WS/results/resilience"
+
 
 # ── Verify shortcut ───────────────────────────────────────────────────────────
 if [[ $VERIFY -eq 1 ]]; then
@@ -135,29 +152,23 @@ master_healthy() {
 }
 
 images_exist() {
-    docker image inspect pdc_project-master &>/dev/null
-}
+images_exist()   { docker image inspect pdc_project-master &>/dev/null; }
 
 ensure_cluster() {
     local n="$RESILIENCE_NODES"
-
     if master_running && master_healthy; then
         local running
         running=$(docker ps --filter "name=rpic_" --filter "status=running" \
-                             --format "{{.Names}}" 2>/dev/null | wc -l)
+                     --format "{{.Names}}" 2>/dev/null | wc -l)
         if [[ $running -ge $n ]]; then
-            log "  Cluster already running ($running containers)"
-            return 0
+            log "  Cluster already running ($running containers)"; return 0
         fi
         log "  Only $running/$n containers — starting missing workers..."
         cd "$SCRIPT_DIR"
         docker compose --profile "${n}-nodes" up -d 2>&1 | tee -a "$LOG_FILE"
-        sleep 3
-        return 0
+        sleep 3; return 0
     fi
-
     cd "$SCRIPT_DIR"
-
     if images_exist; then
         docker compose \
             --profile 2-nodes --profile 3-nodes --profile 4-nodes \
@@ -170,7 +181,6 @@ ensure_cluster() {
         docker compose --profile "${n}-nodes" up -d --build \
             2>&1 | tee -a "$LOG_FILE" || die "docker compose up --build failed"
     fi
-
     log "  Waiting for rpic_master..."
     local retries=0
     until master_healthy || [[ $retries -ge 40 ]]; do
@@ -182,32 +192,75 @@ ensure_cluster() {
     log "  Cluster ready ($n nodes)"
 }
 
-hostlist_for() {
-    local n="$1"
-    if [[ $NATIVE -eq 1 && -f "$SCRIPT_DIR/../rpi/config.env" ]]; then
-        source "$SCRIPT_DIR/../rpi/config.env"
-        local ALL_IPS=("$MASTER_IP" "$WORKER1_IP" "$WORKER2_IP" "$WORKER3_IP" "$WORKER4_IP" "$WORKER5_IP")
-        local hosts=()
-        for ((i=0; i<n; i++)); do hosts+=("${ALL_IPS[$i]}"); done
-        local IFS=','; echo "${hosts[*]}"
+# ── Ensure datasets exist (laptop or Pi) ──────────────────────────────────────
+ensure_datasets() {
+    local LOCAL_DS="$WS/vision/datasets"
+    local -a needed=("$@")
+
+    if [[ $NATIVE -eq 1 ]]; then
+        # Native mode: check Pi, rsync from laptop if missing
+        local REMOTE_DS="$NATIVE_WS/vision/datasets"
+        $EXEC_PREFIX mkdir -p "$REMOTE_DS" 2>/dev/null || true
+        for ds in "${needed[@]}"; do
+            if ! $EXEC_PREFIX test -d "$REMOTE_DS/$ds" 2>/dev/null; then
+                log "  Dataset '$ds' missing on Pi — pushing from laptop..."
+                if [[ -d "$LOCAL_DS/$ds" ]]; then
+                    rsync -az --info=progress2 \
+                        "$LOCAL_DS/$ds/" \
+                        "${MASTER_USER}@${MASTER_IP}:${REMOTE_DS}/${ds}/" \
+                        2>&1 | tee -a "$LOG_FILE"
+                    log "  ✓ '$ds' pushed to Pi"
+                else
+                    log "  [WARN] '$ds' also missing locally."
+                    log "         Run Docker mode first to download: ./analysis/resilience_analysis.sh --fix"
+                fi
+            else
+                log "  Dataset '$ds': already on Pi ✓"
+            fi
+        done
     else
-        local hosts=(master)
-        for ((i=1; i<n; i++)); do hosts+=("worker$i"); done
-        local IFS=','; echo "${hosts[*]}"
+        # Docker mode: run centralized downloader inside container
+        local DL_FLAGS=""
+        [[ $FIX -eq 1 ]] && DL_FLAGS="--fix"
+        [[ $WITH_COCO -eq 1 ]] && DL_FLAGS="$DL_FLAGS --coco"
+        local needed_flags=""
+        for ds in "${needed[@]}"; do
+            case "$ds" in
+                BSDS500)      needed_flags="$needed_flags --bsds 1" ;;
+                coco-val2017) needed_flags="$needed_flags --coco" ;;
+            esac
+        done
+        $EXEC_PREFIX bash "$CONT_WS/vision/shared/download_datasets.sh" \
+            $DL_FLAGS $needed_flags 2>&1 | tee -a "$LOG_FILE"
     fi
 }
 
-# ── Step 1: Start cluster ─────────────────────────────────────────────────────
-section "STEP 1: Starting cluster (${RESILIENCE_NODES} nodes)"
-cd "$SCRIPT_DIR"
-ensure_cluster
+# ── ensure_build_on_pi: deploy source + compile if binaries missing ───────────
+ensure_build_on_pi() {
+    if [[ $FIX -eq 1 ]] || ! $EXEC_PREFIX test -f "$NATIVE_WS/build/sobel_arch1" 2>/dev/null; then
+        log "  Binaries missing on Pi (or --fix) — running deploy..."
+        bash "$SCRIPT_DIR/../rpi/deploy.sh" 2>&1 | tee -a "$LOG_FILE"
+        log "  ✓ Deploy complete"
+    else
+        log "  Binaries already on Pi ✓"
+        SKIP_BUILD=1
+    fi
+}
 
-log "Verifying MPI connectivity..."
-$DOCKER_CMD mpirun --allow-run-as-root -n "$RESILIENCE_NODES" \
-    --host "$(hostlist_for "$RESILIENCE_NODES")" hostname \
-    2>&1 | tee -a "$LOG_FILE" \
-    && log "Cluster verification: OK" \
-    || log "[WARN] Cluster verification failed — continuing anyway"
+# ── Step 1: Start cluster / Prepare Pi ───────────────────────────────────────
+if [[ $NATIVE -eq 0 ]]; then
+    section "STEP 1: Starting cluster (${RESILIENCE_NODES} nodes)"
+    cd "$SCRIPT_DIR"
+    ensure_cluster
+    log "Verifying MPI connectivity..."
+    $EXEC_PREFIX mpirun --allow-run-as-root -n "$RESILIENCE_NODES" \
+        --host "$(hostlist_for "$RESILIENCE_NODES")" hostname \
+        2>&1 | tee -a "$LOG_FILE" \
+        && log "Cluster verification: OK" \
+        || log "[WARN] Cluster verification failed — continuing anyway"
+else
+    section "STEP 1: Preparing RPi cluster (${RESILIENCE_NODES} nodes, SSH)"
+    ensure_build_on_pi
 fi
 
 # ── Run helper with timeout guard ─────────────────────────────────────────────
@@ -218,13 +271,13 @@ runc() {
     hostlist="$(hostlist_for "$nodes")"
     log "  [RUN] $bin  nodes=$nodes  args=$args"
 
-    local cmd="cd /home/pi/workspace && \
+    local cmd="cd $CONT_WS && \
         mpirun --allow-run-as-root -n ${nodes} --host ${hostlist} \
-        /home/pi/workspace/${bin} ${args}"
+        ${CONT_WS}/${bin} ${args}"
 
     if [[ "${TIMEOUT_SECS:-0}" -gt 0 ]]; then
         timeout "$TIMEOUT_SECS" \
-            $DOCKER_CMD bash -c "$cmd" \
+            $EXEC_PREFIX bash -c "$cmd" \
             2>&1 | tee -a "$LOG_FILE"
         local ec=${PIPESTATUS[0]}
         if [[ $ec -eq 124 ]]; then
@@ -233,7 +286,7 @@ runc() {
             log "  [WARN] $bin exited $ec (continuing)"
         fi
     else
-        $DOCKER_CMD bash -c "$cmd" \
+        $EXEC_PREFIX bash -c "$cmd" \
             2>&1 | tee -a "$LOG_FILE" \
         || log "  [WARN] $bin exited non-zero (continuing)"
     fi
@@ -242,36 +295,33 @@ runc() {
 compile_binary() {
     local src_stem="$1" out_name="$2"
     log "  [COMPILE] $src_stem → $out_name"
-         $DOCKER_CMD bash -c \
-        "cd /home/pi/workspace && \
+    $EXEC_PREFIX bash -c \
+        "cd $CONT_WS && \
          mkdir -p \$(dirname $out_name) && \
          mpic++ -std=c++17 -O2 -fopenmp -I./vision/shared ${src_stem}.cpp -o ${out_name} -lm" \
         2>&1 | tee -a "$LOG_FILE" \
     || log "  [WARN] Compile failed for $src_stem"
 }
 
-
-
 # ── Step 2: Select test image ─────────────────────────────────────────────────
 section "STEP 2: Dataset management + test image selection (--fix=$FIX)"
 RES_IMG=""
 
 if [[ -n "$CUSTOM_IMAGE" ]]; then
-    $DOCKER_CMD test -f "$CUSTOM_IMAGE" 2>/dev/null \
+    $EXEC_PREFIX test -f "$CUSTOM_IMAGE" 2>/dev/null \
         || die "Custom image not found in container: $CUSTOM_IMAGE"
     RES_IMG="$CUSTOM_IMAGE"
     log "  Using custom image: $RES_IMG"
 else
     # ── Ensure Dataset ──────────────────────────────────────────────
-    DL_FLAGS=""
-    [[ $FIX -eq 1 ]] && DL_FLAGS="--fix"
-    [[ $WITH_COCO -eq 1 ]] && DL_FLAGS="$DL_FLAGS --coco"
+    NEEDED_DS=("BSDS500")
+    [[ $WITH_COCO -eq 1 ]] && NEEDED_DS+=("coco-val2017")
+    ensure_datasets "${NEEDED_DS[@]}"
 
-    log "  Running centralized dataset downloader..."
-    $DOCKER_CMD bash /home/pi/workspace/vision/shared/download_datasets.sh $DL_FLAGS --bsds 1 2>&1 | tee -a "$LOG_FILE"
+    # ensure_datasets handles the downloading/syncing now.
 
     BSDS_DIR="$DS_ROOT/BSDS500/images"
-    RES_IMG=$($DOCKER_CMD bash -c \
+    RES_IMG=$($EXEC_PREFIX bash -c \
         "find '$BSDS_DIR' -name '*.jpg' 2>/dev/null | sort | head -1" \
         2>/dev/null || true)
         
@@ -279,7 +329,7 @@ else
         log "  Using BSDS500 image: $RES_IMG"
     else
         log "  BSDS500 unavailable — trying COCO fallback (--with-coco)..."
-        COCO_IMG=$($DOCKER_CMD bash -c \
+        COCO_IMG=$($EXEC_PREFIX bash -c \
             "find '$DS_ROOT/coco-val2017' -name '*.jpg' 2>/dev/null | sort | head -1" \
             2>/dev/null || true)
         if [[ -n "$COCO_IMG" ]]; then
@@ -313,8 +363,8 @@ else
     log "  Using existing binaries in workspace/$BUILD/"
 fi
 
-RES_CONT="/home/pi/workspace/results/resilience"
-$DOCKER_CMD mkdir -p "$RES_CONT" 2>/dev/null || true
+RES_CONT="$CONT_WS/results/resilience"
+$EXEC_PREFIX mkdir -p "$RES_CONT" 2>/dev/null || true
 
 # ── Step 4: Serial baseline (for checksum reference) ─────────────────────────
 section "STEP 4: Serial baseline (checksum reference)"
@@ -383,9 +433,9 @@ fi
 # ── Step 7: Copy reconstructed resilience images ──────────────────────────────
 section "STEP 7: Copying resilience results to $OUT_DIR"
 mkdir -p "$OUT_DIR/resilience_images"
-if $DOCKER_CMD test -d "$RES_CONT" 2>/dev/null; then
-    $DOCKER_CMD bash -c \
-        "cd /home/pi/workspace/results && tar cf - resilience" \
+if $EXEC_PREFIX test -d "$RES_CONT" 2>/dev/null; then
+    $EXEC_PREFIX bash -c \
+        "cd $CONT_WS/results && tar cf - resilience" \
         | tar xf - -C "$WS/results/" 2>/dev/null || true
     cp -r "$WS/results/resilience/." "$OUT_DIR/resilience_images/" 2>/dev/null || true
     log "  Resilience images → $OUT_DIR/resilience_images/"

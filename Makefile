@@ -152,8 +152,8 @@ destroy:
 # Does NOT remove compiled binaries (workspace/build/) or datasets
 clean-results:
 	@echo "Removing generated reports, logs, and result images..."
-	rm -rf report/ report_bsds/ report_resilience/
-	rm -f analysis_results.log report_bsds/analysis_bsds.log report_resilience/analysis_resilience.log
+	rm -rf analysis/report/ analysis/report_bsds/ analysis/report_resilience/
+	rm -f analysis/*.log analysis/report_bsds/*.log analysis/report_resilience/*.log
 	@echo "Removing result images and lists from workspace/results/..."
 	rm -rf workspace/results/
 	@echo "Done — run any analysis script to regenerate"

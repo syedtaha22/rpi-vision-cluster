@@ -70,9 +70,25 @@ OUT_DIR="$SCRIPT_DIR/report_bsds"
 LOG_FILE="$OUT_DIR/analysis_bsds.log"
 WS="$SCRIPT_DIR/../workspace"
 BUILD="build"
+DS_ROOT="$CONT_WS/vision/datasets"
+[[ $NATIVE -eq 1 ]] && DS_ROOT="$WS/vision/datasets"
 
-DOCKER_CMD="docker exec -u pi rpic_master"
-[[ $NATIVE -eq 1 ]] && DOCKER_CMD=""
+# EXEC_PREFIX: Docker mode = docker exec; Native mode = ssh to master Pi
+EXEC_PREFIX="docker exec -u pi rpic_master"
+if [[ $NATIVE -eq 1 ]]; then
+    RPI_CONFIG="$SCRIPT_DIR/../rpi/config.env"
+    if [[ ! -f "$RPI_CONFIG" ]] || grep -q "__FILL_IN__" "$RPI_CONFIG" 2>/dev/null; then
+        echo "  config.env missing — running gen_config.sh..."
+        bash "$SCRIPT_DIR/../rpi/gen_config.sh" \
+            || { echo "[FATAL] gen_config.sh failed"; exit 1; }
+    fi
+    source "$RPI_CONFIG"
+    NATIVE_WS=$(ssh "${MASTER_USER}@${MASTER_IP}" "echo ${RPI_WORKSPACE_DIR}" 2>/dev/null) \
+        || { echo "[FATAL] Cannot SSH to ${MASTER_USER}@${MASTER_IP}"; exit 1; }
+    CONT_WS="$NATIVE_WS"
+    DS_ROOT="$NATIVE_WS/vision/datasets"
+    EXEC_PREFIX="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new ${MASTER_USER}@${MASTER_IP}"
+fi
 
 mkdir -p "$OUT_DIR"
 
@@ -144,33 +160,26 @@ master_running() {
 }
 
 master_healthy() {
-    $DOCKER_CMD echo "ok" &>/dev/null
+    $EXEC_PREFIX echo "ok" &>/dev/null
 }
 
-images_exist() {
-    docker image inspect pdc_project-master &>/dev/null
-}
+images_exist()   { docker image inspect pdc_project-master &>/dev/null; }
 
 ensure_cluster() {
     local n="$MAX_NODES"
-
     if master_running && master_healthy; then
         local running
         running=$(docker ps --filter "name=rpic_" --filter "status=running" \
-                             --format "{{.Names}}" 2>/dev/null | wc -l)
+                     --format "{{.Names}}" 2>/dev/null | wc -l)
         if [[ $running -ge $n ]]; then
-            log "  Cluster already running and healthy ($running containers)"
-            return 0
+            log "  Cluster already running and healthy ($running containers)"; return 0
         fi
         log "  Only $running/$n containers — starting missing workers..."
         cd "$SCRIPT_DIR"
         docker compose --profile "${n}-nodes" up -d 2>&1 | tee -a "$LOG_FILE"
-        sleep 3
-        return 0
+        sleep 3; return 0
     fi
-
     cd "$SCRIPT_DIR"
-
     if images_exist; then
         docker compose \
             --profile 2-nodes --profile 3-nodes --profile 4-nodes \
@@ -183,7 +192,6 @@ ensure_cluster() {
         docker compose --profile "${n}-nodes" up -d --build \
             2>&1 | tee -a "$LOG_FILE" || die "docker compose up --build failed"
     fi
-
     log "  Waiting for rpic_master..."
     local retries=0
     until master_healthy || [[ $retries -ge 40 ]]; do
@@ -195,32 +203,73 @@ ensure_cluster() {
     log "  Cluster ready ($n nodes)"
 }
 
-hostlist_for() {
-    local n="$1"
-    if [[ $NATIVE -eq 1 && -f "$SCRIPT_DIR/../rpi/config.env" ]]; then
-        source "$SCRIPT_DIR/../rpi/config.env"
-        local ALL_IPS=("$MASTER_IP" "$WORKER1_IP" "$WORKER2_IP" "$WORKER3_IP" "$WORKER4_IP" "$WORKER5_IP")
-        local hosts=()
-        for ((i=0; i<n; i++)); do hosts+=("${ALL_IPS[$i]}"); done
-        local IFS=','; echo "${hosts[*]}"
+# ── Ensure datasets exist (laptop or Pi) ──────────────────────────────────────
+ensure_datasets() {
+    local LOCAL_DS="$WS/vision/datasets"
+    local -a needed=("$@")
+
+    if [[ $NATIVE -eq 1 ]]; then
+        # Native mode: check Pi, rsync from laptop if missing
+        local REMOTE_DS="$NATIVE_WS/vision/datasets"
+        $EXEC_PREFIX mkdir -p "$REMOTE_DS" 2>/dev/null || true
+        for ds in "${needed[@]}"; do
+            if ! $EXEC_PREFIX test -d "$REMOTE_DS/$ds" 2>/dev/null; then
+                log "  Dataset '$ds' missing on Pi — pushing from laptop..."
+                if [[ -d "$LOCAL_DS/$ds" ]]; then
+                    rsync -az --info=progress2 \
+                        "$LOCAL_DS/$ds/" \
+                        "${MASTER_USER}@${MASTER_IP}:${REMOTE_DS}/${ds}/" \
+                        2>&1 | tee -a "$LOG_FILE"
+                    log "  ✓ '$ds' pushed to Pi"
+                else
+                    log "  [WARN] '$ds' also missing locally."
+                    log "         Run Docker mode first to download: ./analysis/run_analysis_bsds.sh --fix"
+                fi
+            else
+                log "  Dataset '$ds': already on Pi ✓"
+            fi
+        done
     else
-        local hosts=(master)
-        for ((i=1; i<n; i++)); do hosts+=("worker$i"); done
-        local IFS=','; echo "${hosts[*]}"
+        # Docker mode: run centralized downloader inside container
+        local DL_FLAGS=""
+        [[ $FIX -eq 1 ]] && DL_FLAGS="--fix"
+        local needed_flags=""
+        for ds in "${needed[@]}"; do
+            case "$ds" in
+                BSDS500) needed_flags="$needed_flags --bsds $BSDS_N" ;;
+            esac
+        done
+        $EXEC_PREFIX bash "$CONT_WS/vision/shared/download_datasets.sh" \
+            $DL_FLAGS $needed_flags 2>&1 | tee -a "$LOG_FILE"
     fi
 }
 
-# ── Step 1: Start cluster ─────────────────────────────────────────────────────
-section "STEP 1: Starting cluster (${MAX_NODES} nodes)"
-cd "$SCRIPT_DIR"
-ensure_cluster
+# ── ensure_build_on_pi: deploy source + compile if binaries missing ───────────
+ensure_build_on_pi() {
+    if [[ $FIX -eq 1 ]] || ! $EXEC_PREFIX test -f "$NATIVE_WS/build/sobel_arch1" 2>/dev/null; then
+        log "  Binaries missing on Pi (or --fix) — running deploy..."
+        bash "$SCRIPT_DIR/../rpi/deploy.sh" 2>&1 | tee -a "$LOG_FILE"
+        log "  ✓ Deploy complete"
+    else
+        log "  Binaries already on Pi ✓"
+        SKIP_BUILD=1
+    fi
+}
 
-log "Verifying MPI connectivity..."
-$DOCKER_CMD mpirun --allow-run-as-root -n "$MAX_NODES" \
-    --host "$(hostlist_for "$MAX_NODES")" hostname \
-    2>&1 | tee -a "$LOG_FILE" \
-    && log "Cluster verification: OK" \
-    || log "[WARN] Cluster verification failed — continuing anyway"
+# ── Step 1: Start cluster / Prepare Pi ───────────────────────────────────────
+if [[ $NATIVE -eq 0 ]]; then
+    section "STEP 1: Starting cluster (${MAX_NODES} nodes)"
+    cd "$SCRIPT_DIR"
+    ensure_cluster
+    log "Verifying MPI connectivity..."
+    $EXEC_PREFIX mpirun --allow-run-as-root -n "$MAX_NODES" \
+        --host "$(hostlist_for "$MAX_NODES")" hostname \
+        2>&1 | tee -a "$LOG_FILE" \
+        && log "Cluster verification: OK" \
+        || log "[WARN] Cluster verification failed — continuing anyway"
+else
+    section "STEP 1: Preparing RPi cluster (${MAX_NODES} nodes, SSH)"
+    ensure_build_on_pi
 fi
 
 # ── Run helper with timeout guard ─────────────────────────────────────────────
@@ -231,13 +280,13 @@ runc() {
     hostlist="$(hostlist_for "$nodes")"
     log "  [RUN] $bin  nodes=$nodes  args=$args"
 
-    local cmd="cd /home/pi/workspace && \
+    local cmd="cd $CONT_WS && \
         mpirun --allow-run-as-root -n ${nodes} --host ${hostlist} \
-        /home/pi/workspace/${bin} ${args}"
+        ${CONT_WS}/${bin} ${args}"
 
     if [[ "${TIMEOUT_SECS:-0}" -gt 0 ]]; then
         timeout "$TIMEOUT_SECS" \
-            $DOCKER_CMD bash -c "$cmd" \
+            $EXEC_PREFIX bash -c "$cmd" \
             2>&1 | tee -a "$LOG_FILE"
         local ec=${PIPESTATUS[0]}
         if [[ $ec -eq 124 ]]; then
@@ -246,7 +295,7 @@ runc() {
             log "  [WARN] $bin exited $ec (continuing)"
         fi
     else
-        $DOCKER_CMD bash -c "$cmd" \
+        $EXEC_PREFIX bash -c "$cmd" \
             2>&1 | tee -a "$LOG_FILE" \
         || log "  [WARN] $bin exited non-zero (continuing)"
     fi
@@ -255,24 +304,18 @@ runc() {
 compile_binary() {
     local src_stem="$1" out_name="$2"
     log "  [COMPILE] $src_stem → $out_name"
-         ${DOCKER_CMD:-bash -c} \
-        "cd /home/pi/workspace && \
+    $EXEC_PREFIX bash -c \
+        "cd $CONT_WS && \
          mkdir -p \$(dirname $out_name) && \
          mpic++ -std=c++17 -O2 -fopenmp -I./vision/shared ${src_stem}.cpp -o ${out_name} -lm" \
         2>&1 | tee -a "$LOG_FILE" \
     || log "  [WARN] Compile failed for $src_stem"
 }
 
-
-
 # ── Step 2: BSDS500 dataset ───────────────────────────────────────────────────
 section "STEP 2: BSDS500 Dataset Management (--fix=$FIX)"
 
-DL_FLAGS=""
-[[ $FIX -eq 1 ]] && DL_FLAGS="--fix"
-
-log "  Running centralized dataset downloader..."
-$DOCKER_CMD bash /home/pi/workspace/vision/shared/download_datasets.sh $DL_FLAGS --bsds $BSDS_N 2>&1 | tee -a "$LOG_FILE"
+ensure_datasets "BSDS500"
 
 BSDS_DIR="$DS_ROOT/BSDS500/images"
 BSDS_GT_DIR="$DS_ROOT/BSDS500/groundTruth_png"
@@ -281,7 +324,7 @@ mkdir -p "$WS/results"
 BSDS_LIST_HOST="$WS/results/bsds_img_list.txt"
 BSDS_LIST_CONT="$CONT_WS/results/bsds_img_list.txt"
 
-$DOCKER_CMD bash -c \
+$EXEC_PREFIX bash -c \
     "find '$BSDS_DIR' -name '*.jpg' | sort | head -${BSDS_N}" \
     > "$BSDS_LIST_HOST"
 ACTUAL_N=$(wc -l < "$BSDS_LIST_HOST")
@@ -289,19 +332,19 @@ ACTUAL_N=$(wc -l < "$BSDS_LIST_HOST")
 log "  Image list: $ACTUAL_N images -> $BSDS_LIST_HOST"
 
 GT_AVAILABLE=0
-if $DOCKER_CMD test -d "$BSDS_GT_DIR" 2>/dev/null; then
+if $EXEC_PREFIX test -d "$BSDS_GT_DIR" 2>/dev/null; then
     GT_AVAILABLE=1
     log "  Ground-truth directory found: $BSDS_GT_DIR"
 else
     log "  [WARN] Ground-truth dir not found ($BSDS_GT_DIR) — quality metrics will be skipped"
 fi
 
-BSDS_OUT_CONT="/home/pi/workspace/results/bsds_out"
+BSDS_OUT_CONT="$CONT_WS/results/bsds_out"
 for sub in sobel_arch1 sobel_arch2 sobel_arch3 sobel_arch4 \
            canny_arch1 canny_arch2 canny_arch3 canny_arch4 \
            log_arch1  log_arch2  log_arch3  log_arch4  \
            fft_arch1  fft_arch2  fft_arch3  fft_arch4; do
-    $DOCKER_CMD mkdir -p "$BSDS_OUT_CONT/$sub" 2>/dev/null || true
+    $EXEC_PREFIX mkdir -p "$BSDS_OUT_CONT/$sub" 2>/dev/null || true
 done
 
 # ── Step 3: Build ─────────────────────────────────────────────────────────────
@@ -399,7 +442,7 @@ while IFS= read -r img; do
     done
 done < "$BSDS_LIST_HOST"
 log "IMAGE: BSDS_BATCH_CANNY"
-$DOCKER_CMD mkdir -p "$BSDS_OUT_CONT/canny_arch4" 2>/dev/null || true
+$EXEC_PREFIX mkdir -p "$BSDS_OUT_CONT/canny_arch4" 2>/dev/null || true
 runc 4 "$BUILD/canny_arch4" "$BSDS_LIST_CONT $BSDS_OUT_CONT/canny_arch4 $ACTUAL_N"
 
 section "STEP 7: LoG — All Architectures (BSDS500)"
@@ -422,9 +465,9 @@ done < "$BSDS_LIST_HOST"
 # ── Step 9: Copy reconstructed images ─────────────────────────────────────────
 section "STEP 9: Copying reconstructed images to $OUT_DIR"
 mkdir -p "$OUT_DIR/reconstructed"
-if $DOCKER_CMD test -d "$BSDS_OUT_CONT" 2>/dev/null; then
-    $DOCKER_CMD bash -c \
-        "cd /home/pi/workspace/results && tar cf - bsds_out" \
+if $EXEC_PREFIX test -d "$BSDS_OUT_CONT" 2>/dev/null; then
+    $EXEC_PREFIX bash -c \
+        "cd $CONT_WS/results && tar cf - bsds_out" \
         | tar xf - -C "$WS/results/" 2>/dev/null || true
     cp -r "$WS/results/bsds_out/." "$OUT_DIR/reconstructed/" 2>/dev/null || true
     log "  Reconstructed images → $OUT_DIR/reconstructed/"
@@ -436,7 +479,7 @@ mkdir -p "$OUT_DIR/originals"
 if [[ -n "$BSDS_LIST_HOST" && -f "$BSDS_LIST_HOST" ]]; then
     while IFS= read -r orig_img; do
         cp_dest="$OUT_DIR/originals/$(basename "$orig_img")"
-        $DOCKER_CMD bash -c \
+        $EXEC_PREFIX bash -c \
             "cat '$orig_img'" > "$cp_dest" 2>/dev/null || true
     done < "$BSDS_LIST_HOST"
     orig_count=$(find "$OUT_DIR/originals" -name "*.jpg" -o -name "*.png" 2>/dev/null | wc -l)
@@ -449,7 +492,7 @@ fi
 section "STEP 10: Generating BSDS500 Report"
 GT_ARG=""
 if [[ $GT_AVAILABLE -eq 1 ]]; then
-    $DOCKER_CMD bash -c \
+    $EXEC_PREFIX bash -c \
         "cd '$DS_ROOT/BSDS500' && tar cf - groundTruth_png" \
         | tar xf - -C "$WS/results/gt/" 2>/dev/null || true
     GT_ARG="--gt-dir $WS/results/gt/groundTruth_png"

@@ -47,9 +47,14 @@ source "$CONFIG"
 WORKER_USERS=("$WORKER1_USER" "$WORKER2_USER" "$WORKER3_USER" "$WORKER4_USER" "$WORKER5_USER")
 WORKER_IPS=( "$WORKER1_IP"   "$WORKER2_IP"   "$WORKER3_IP"   "$WORKER4_IP"   "$WORKER5_IP")
 
+# Paths — driven entirely by config.env so they match every Pi's Desktop layout
+# Default: ~/Desktop/rpi-vision-cluster/workspace (overrideable in config.env)
+RPI_WORKSPACE_DIR="${RPI_WORKSPACE_DIR:-~/Desktop/rpi-vision-cluster/workspace}"
+RPI_WS_PARENT="${RPI_WS_PARENT:-~/Desktop/PDC_project}"
+
 WORKSPACE_LOCAL="${REPO_ROOT}/workspace"
-WORKSPACE_REMOTE="~/workspace"
-BUILD_REMOTE="~/workspace/build"
+WORKSPACE_REMOTE="${RPI_WORKSPACE_DIR}"
+BUILD_REMOTE="${RPI_WORKSPACE_DIR}/build"
 
 # ── Step 1: Sync workspace/ to master ────────────────────────────────────────
 if [[ $SKIP_SYNC -eq 0 ]]; then
@@ -65,11 +70,12 @@ if [[ $SKIP_SYNC -eq 0 ]]; then
         "${MASTER_USER}@${MASTER_IP}:${WORKSPACE_REMOTE}/"
     success "workspace/ synced to master"
 
-    # Also copy game files
+    # Also copy game files to the project folder on master
     info "Copying game files → master"
-    scp "${REPO_ROOT}/rpi/game.cpp" "${MASTER_USER}@${MASTER_IP}:~/game.cpp"
-    scp "${REPO_ROOT}/rpi/play_game.sh" "${MASTER_USER}@${MASTER_IP}:~/play_game.sh"
-    ssh "${MASTER_USER}@${MASTER_IP}" "chmod +x ~/play_game.sh"
+    ssh "${MASTER_USER}@${MASTER_IP}" "mkdir -p ${RPI_WS_PARENT}"
+    scp "${REPO_ROOT}/rpi/game.cpp"    "${MASTER_USER}@${MASTER_IP}:${RPI_WS_PARENT}/game.cpp"
+    scp "${REPO_ROOT}/rpi/play_game.sh" "${MASTER_USER}@${MASTER_IP}:${RPI_WS_PARENT}/play_game.sh"
+    ssh "${MASTER_USER}@${MASTER_IP}" "chmod +x ${RPI_WS_PARENT}/play_game.sh"
     success "game files copied"
 else
     warn "Skipping workspace sync (--skip-sync)"
@@ -82,9 +88,9 @@ if [[ $SKIP_COMPILE -eq 0 ]]; then
     # Ensure build dir exists
     ssh "${MASTER_USER}@${MASTER_IP}" "mkdir -p ${BUILD_REMOTE}"
 
-    # Compile game.cpp → /tmp/game
-    info "Compiling game.cpp → /tmp/game"
-    ssh "${MASTER_USER}@${MASTER_IP}" "mpic++ -O2 -std=c++17 -o /tmp/game ~/game.cpp"
+    # Compile game.cpp
+    info "Compiling game.cpp → ${RPI_GAME_BIN:-/tmp/game}"
+    ssh "${MASTER_USER}@${MASTER_IP}" "mpic++ -O2 -std=c++17 -o ${RPI_GAME_BIN:-/tmp/game} ${RPI_WS_PARENT}/game.cpp"
     success "game binary compiled"
 
     # Compile all 18 vision architecture binaries.
@@ -94,42 +100,43 @@ if [[ $SKIP_COMPILE -eq 0 ]]; then
     # in Docker and Raspberry Pi OS on the real hardware.
     # Both environments use openmpi-bin/libopenmpi-dev for consistency.
     info "Compiling all vision architecture binaries (this takes a few minutes)..."
-    ssh "${MASTER_USER}@${MASTER_IP}" bash << 'REMOTE_COMPILE'
+    RPI_WS_EXPANDED=$(ssh "${MASTER_USER}@${MASTER_IP}" "echo ${RPI_WORKSPACE_DIR}")
+    ssh "${MASTER_USER}@${MASTER_IP}" WS="${RPI_WS_EXPANDED}" bash << 'REMOTE_COMPILE'
 set -e
-cd ~/workspace
-W=~/workspace/vision
-B=~/workspace/build
-# Use the same flags as the Docker workspace/Makefile
-FLAGS="-std=c++17 -O2 -I${HOME}/workspace/vision/shared"
+cd "$WS"
+B="${WS}/build"
+mkdir -p "$B"
+# Use the same flags as the Docker build
+FLAGS="-std=c++17 -O2 -I${WS}/vision/shared"
 
 echo "  [arch1] OpenMP Farm..."
-mpic++ ${FLAGS} -fopenmp ${W}/sobel/sobel_arch1_farm.cpp     -o ${B}/sobel_arch1 -lm
-mpic++ ${FLAGS} -fopenmp ${W}/log/log_arch1_farm.cpp         -o ${B}/log_arch1   -lm
-mpic++ ${FLAGS} -fopenmp ${W}/canny/canny_arch1_farm.cpp     -o ${B}/canny_arch1 -lm
-mpic++ ${FLAGS} -fopenmp ${W}/fft/fft_arch1_farm.cpp         -o ${B}/fft_arch1   -lm
+mpic++ ${FLAGS} -fopenmp ${WS}/vision/sobel/sobel_arch1_farm.cpp     -o ${B}/sobel_arch1 -lm
+mpic++ ${FLAGS} -fopenmp ${WS}/vision/log/log_arch1_farm.cpp         -o ${B}/log_arch1   -lm
+mpic++ ${FLAGS} -fopenmp ${WS}/vision/canny/canny_arch1_farm.cpp     -o ${B}/canny_arch1 -lm
+mpic++ ${FLAGS} -fopenmp ${WS}/vision/fft/fft_arch1_farm.cpp         -o ${B}/fft_arch1   -lm
 
 echo "  [arch2] OpenMP Pipeline..."
-mpic++ ${FLAGS} -fopenmp ${W}/sobel/sobel_arch2_pipeline.cpp -o ${B}/sobel_arch2 -lm
-mpic++ ${FLAGS} -fopenmp ${W}/log/log_arch2_pipeline.cpp     -o ${B}/log_arch2   -lm
-mpic++ ${FLAGS} -fopenmp ${W}/canny/canny_arch2_pipeline.cpp -o ${B}/canny_arch2 -lm
-mpic++ ${FLAGS} -fopenmp ${W}/fft/fft_arch2_pipeline.cpp     -o ${B}/fft_arch2   -lm
+mpic++ ${FLAGS} -fopenmp ${WS}/vision/sobel/sobel_arch2_pipeline.cpp -o ${B}/sobel_arch2 -lm
+mpic++ ${FLAGS} -fopenmp ${WS}/vision/log/log_arch2_pipeline.cpp     -o ${B}/log_arch2   -lm
+mpic++ ${FLAGS} -fopenmp ${WS}/vision/canny/canny_arch2_pipeline.cpp -o ${B}/canny_arch2 -lm
+mpic++ ${FLAGS} -fopenmp ${WS}/vision/fft/fft_arch2_pipeline.cpp     -o ${B}/fft_arch2   -lm
 
 echo "  [arch3] MPI Scatter-Gather..."
-mpic++ ${FLAGS} ${W}/sobel/sobel_arch3_scatter.cpp           -o ${B}/sobel_arch3 -lm
-mpic++ ${FLAGS} ${W}/log/log_arch3_scatter.cpp               -o ${B}/log_arch3   -lm
-mpic++ ${FLAGS} ${W}/canny/canny_arch3_scatter.cpp           -o ${B}/canny_arch3 -lm
-mpic++ ${FLAGS} ${W}/fft/fft_arch3_dist_dynamic.cpp          -o ${B}/fft_arch3   -lm
+mpic++ ${FLAGS} ${WS}/vision/sobel/sobel_arch3_scatter.cpp           -o ${B}/sobel_arch3 -lm
+mpic++ ${FLAGS} ${WS}/vision/log/log_arch3_scatter.cpp               -o ${B}/log_arch3   -lm
+mpic++ ${FLAGS} ${WS}/vision/canny/canny_arch3_scatter.cpp           -o ${B}/canny_arch3 -lm
+mpic++ ${FLAGS} ${WS}/vision/fft/fft_arch3_dist_dynamic.cpp          -o ${B}/fft_arch3   -lm
 
 echo "  [arch4] MPI Distributed Pipeline..."
-mpic++ ${FLAGS} ${W}/sobel/sobel_arch4_pipeline.cpp          -o ${B}/sobel_arch4 -lm
-mpic++ ${FLAGS} ${W}/log/log_arch4_pipeline.cpp              -o ${B}/log_arch4   -lm
-mpic++ ${FLAGS} ${W}/canny/canny_arch4_pipeline.cpp          -o ${B}/canny_arch4 -lm
-mpic++ ${FLAGS} ${W}/fft/fft_arch4_dist_pipeline.cpp         -o ${B}/fft_arch4   -lm
+mpic++ ${FLAGS} ${WS}/vision/sobel/sobel_arch4_pipeline.cpp          -o ${B}/sobel_arch4 -lm
+mpic++ ${FLAGS} ${WS}/vision/log/log_arch4_pipeline.cpp              -o ${B}/log_arch4   -lm
+mpic++ ${FLAGS} ${WS}/vision/canny/canny_arch4_pipeline.cpp          -o ${B}/canny_arch4 -lm
+mpic++ ${FLAGS} ${WS}/vision/fft/fft_arch4_dist_pipeline.cpp         -o ${B}/fft_arch4   -lm
 
 echo "  [extras] Bully election, resilience, baselines..."
-mpic++ ${FLAGS} ${W}/resilience/bully_election.cpp           -o ${B}/bully_election  -lm
-mpic++ ${FLAGS} ${W}/resilience/resilience_test.cpp          -o ${B}/resilience_test -lm
-mpic++ ${FLAGS} ${W}/shared/baselines.cpp                    -o ${B}/baselines        -lm
+mpic++ ${FLAGS} ${WS}/vision/resilience/bully_election.cpp           -o ${B}/bully_election  -lm
+mpic++ ${FLAGS} ${WS}/vision/resilience/resilience_test.cpp          -o ${B}/resilience_test -lm
+mpic++ ${FLAGS} ${WS}/vision/shared/baselines.cpp                    -o ${B}/baselines        -lm
 
 echo "  Done."
 REMOTE_COMPILE

@@ -36,7 +36,10 @@ warn()    { echo -e "${YELLOW}[setup] ⚠${NC} $*"; }
 die()     { echo -e "${RED}[setup] ✗ FATAL:${NC} $*" >&2; exit 1; }
 
 # ── Step 0: Load & validate config ───────────────────────────────────────────
-[[ -f "$CONFIG" ]] || die "config.env not found.\n  Run: cp rpi/config.env.template rpi/config.env && nano rpi/config.env"
+if [[ ! -f "$CONFIG" ]] || grep -q "__FILL_IN__" "$CONFIG" 2>/dev/null; then
+    info "config.env missing or incomplete — running gen_config.sh first..."
+    bash "${SCRIPT_DIR}/gen_config.sh" || die "gen_config.sh failed. Fix config.env manually and re-run."
+fi
 
 # shellcheck source=/dev/null
 source "$CONFIG"

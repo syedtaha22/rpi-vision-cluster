@@ -69,12 +69,33 @@ IMAGES=()
 # ── Paths ─────────────────────────────────────────────────────────────────────
 LOG_FILE="$SCRIPT_DIR/analysis_results.log"
 REPORT_DIR="$SCRIPT_DIR/report"
-WS="$SCRIPT_DIR/../workspace"
+CONT_WS="/home/pi/workspace"       # path inside Docker container
+WS="$SCRIPT_DIR/../workspace"      # local workspace on laptop
 BUILD="build"
-DS_ROOT="/home/pi/workspace/vision/datasets"
+DS_ROOT="$CONT_WS/vision/datasets"
 
-DOCKER_CMD="docker exec -u pi rpic_master"
-[[ $NATIVE -eq 1 ]] && DOCKER_CMD=""
+# EXEC_PREFIX — command prefix for all cluster operations:
+#   Docker mode : "docker exec -u pi rpic_master"
+#   Native mode : "ssh -o BatchMode=yes rpi-master@<IP>"
+EXEC_PREFIX="docker exec -u pi rpic_master"
+
+if [[ $NATIVE -eq 1 ]]; then
+    RPI_CONFIG="$SCRIPT_DIR/../rpi/config.env"
+    # Auto-generate config if missing
+    if [[ ! -f "$RPI_CONFIG" ]] || grep -q "__FILL_IN__" "$RPI_CONFIG" 2>/dev/null; then
+        echo "  config.env missing — running gen_config.sh..."
+        bash "$SCRIPT_DIR/../rpi/gen_config.sh" \
+            || { echo "[FATAL] gen_config.sh failed"; exit 1; }
+    fi
+    source "$RPI_CONFIG"
+    # Expand tilde: get the real absolute path on the Pi
+    NATIVE_WS=$(ssh "${MASTER_USER}@${MASTER_IP}" \
+        "echo ${RPI_WORKSPACE_DIR}" 2>/dev/null) \
+        || { echo "[FATAL] Cannot SSH to ${MASTER_USER}@${MASTER_IP}. Check config.env and SSH keys."; exit 1; }
+    CONT_WS="$NATIVE_WS"
+    DS_ROOT="$NATIVE_WS/vision/datasets"
+    EXEC_PREFIX="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new ${MASTER_USER}@${MASTER_IP}"
+fi
 
 mkdir -p "$REPORT_DIR" "$WS/results/out"
 
@@ -86,9 +107,9 @@ if [[ $VERIFY -eq 1 ]]; then
     fi
     echo "[VERIFY] Re-running report generator from: $LOG_FILE"
     python3 "$SCRIPT_DIR/generate_report.py" \
-        --log          "$LOG_FILE" \
-        --outdir       "$REPORT_DIR" \
-        --node-counts  "${NODE_COUNTS[*]}" \
+        --log           "$LOG_FILE" \
+        --outdir        "$REPORT_DIR" \
+        --node-counts   "${NODE_COUNTS[*]}" \
         --thread-counts "${THREAD_COUNTS[*]}"
     exit $?
 fi
@@ -105,68 +126,165 @@ log "Started : $(date)"
 log "Nodes   : ${NODE_COUNTS[*]}"
 log "Threads : ${THREAD_COUNTS[*]}"
 log "Timeout : ${TIMEOUT_SECS}s per run"
-log "COCO    : $([ $WITH_COCO -eq 1 ] && echo enabled || echo disabled  -- use --with-coco to enable)"
+log "Mode    : $([ $NATIVE -eq 1 ] && echo 'Native RPi (SSH)' || echo 'Docker (local)')"
+log "COCO    : $([ $WITH_COCO -eq 1 ] && echo enabled || echo 'disabled -- use --with-coco to enable')"
 
-# ── Step 0: Docker + RAM check ────────────────────────────────────────────────
+MAX_NODES="${NODE_COUNTS[-1]}"
+
+# ── hostlist_for — works in both Docker and Native modes ─────────────────────
+hostlist_for() {
+    local n="$1"
+    if [[ $NATIVE -eq 1 ]]; then
+        local ALL_IPS=("$MASTER_IP" "$WORKER1_IP" "$WORKER2_IP" "$WORKER3_IP" "$WORKER4_IP" "$WORKER5_IP")
+        local hosts=()
+        for ((i=0; i<n; i++)); do hosts+=("${ALL_IPS[$i]}"); done
+        local IFS=','; echo "${hosts[*]}"
+    else
+        local hosts=(master)
+        for ((i=1; i<n; i++)); do hosts+=("worker$i"); done
+        local IFS=','; echo "${hosts[*]}"
+    fi
+}
+
+# ── Run helper with timeout guard ─────────────────────────────────────────────
+runc() {
+    local nodes="$1" bin="$2"; shift 2
+    local args="${*:-}"
+    local hostlist
+    hostlist="$(hostlist_for "$nodes")"
+    log "  [RUN] $bin  nodes=$nodes  args=$args"
+
+    local cmd="cd $CONT_WS && \
+        mpirun --allow-run-as-root -n ${nodes} --host ${hostlist} \
+        ${CONT_WS}/${bin} ${args}"
+
+    if [[ "${TIMEOUT_SECS:-0}" -gt 0 ]]; then
+        timeout "$TIMEOUT_SECS" \
+            $EXEC_PREFIX bash -c "$cmd" \
+            2>&1 | tee -a "$LOG_FILE"
+        local ec=${PIPESTATUS[0]}
+        if [[ $ec -eq 124 ]]; then
+            log "  [TIMEOUT] $bin exceeded ${TIMEOUT_SECS}s — skipping"
+        elif [[ $ec -ne 0 ]]; then
+            log "  [WARN] $bin exited $ec (continuing)"
+        fi
+    else
+        $EXEC_PREFIX bash -c "$cmd" \
+            2>&1 | tee -a "$LOG_FILE" \
+        || log "  [WARN] $bin exited non-zero (continuing)"
+    fi
+}
+
+compile_binary() {
+    local src_stem="$1" out_name="$2"
+    log "  [COMPILE] $src_stem → $out_name"
+    $EXEC_PREFIX bash -c \
+        "cd $CONT_WS && \
+         mkdir -p \$(dirname $out_name) && \
+         mpic++ -std=c++17 -O2 -fopenmp -I./vision/shared ${src_stem}.cpp -o ${out_name} -lm" \
+        2>&1 | tee -a "$LOG_FILE" \
+    || log "  [WARN] Compile failed for $src_stem"
+}
+
+# ── Ensure datasets exist (laptop or Pi) ──────────────────────────────────────
+ensure_datasets() {
+    local LOCAL_DS="$WS/vision/datasets"
+    local -a needed=("$@")
+
+    if [[ $NATIVE -eq 1 ]]; then
+        # Native mode: check Pi, rsync from laptop if missing
+        local REMOTE_DS="$NATIVE_WS/vision/datasets"
+        $EXEC_PREFIX mkdir -p "$REMOTE_DS" 2>/dev/null || true
+        for ds in "${needed[@]}"; do
+            if ! $EXEC_PREFIX test -d "$REMOTE_DS/$ds" 2>/dev/null; then
+                log "  Dataset '$ds' missing on Pi — pushing from laptop..."
+                if [[ -d "$LOCAL_DS/$ds" ]]; then
+                    rsync -az --info=progress2 \
+                        "$LOCAL_DS/$ds/" \
+                        "${MASTER_USER}@${MASTER_IP}:${REMOTE_DS}/${ds}/" \
+                        2>&1 | tee -a "$LOG_FILE"
+                    log "  ✓ '$ds' pushed to Pi"
+                else
+                    log "  [WARN] '$ds' also missing locally."
+                    log "         Run Docker mode first to download: ./analysis/run_analysis.sh --fix"
+                fi
+            else
+                log "  Dataset '$ds': already on Pi ✓"
+            fi
+        done
+    else
+        # Docker mode: run centralized downloader inside container
+        local DL_FLAGS=""
+        [[ $FIX -eq 1 ]] && DL_FLAGS="--fix"
+        [[ $WITH_COCO -eq 1 ]] && DL_FLAGS="$DL_FLAGS --coco"
+        local needed_flags=""
+        for ds in "${needed[@]}"; do
+            case "$ds" in
+                cifar-10)           needed_flags="$needed_flags --cifar" ;;
+                tiny-imagenet-200)  needed_flags="$needed_flags --tiny" ;;
+                coco-val2017)       needed_flags="$needed_flags --coco" ;;
+                BSDS500)            needed_flags="$needed_flags --bsds 1" ;;
+            esac
+        done
+        $EXEC_PREFIX bash "$CONT_WS/vision/shared/download_datasets.sh" \
+            $DL_FLAGS $needed_flags 2>&1 | tee -a "$LOG_FILE"
+    fi
+}
+
+# ── ensure_build_on_pi: deploy source + compile if binaries missing ───────────
+ensure_build_on_pi() {
+    if [[ $FIX -eq 1 ]] || ! $EXEC_PREFIX test -f "$NATIVE_WS/build/sobel_arch1" 2>/dev/null; then
+        log "  Binaries missing on Pi (or --fix) — running deploy..."
+        bash "$SCRIPT_DIR/../rpi/deploy.sh" 2>&1 | tee -a "$LOG_FILE"
+        log "  ✓ Deploy complete"
+    else
+        log "  Binaries already on Pi ✓"
+        SKIP_BUILD=1
+    fi
+}
+
+# ── Step 0: Docker check (Docker mode only) ───────────────────────────────────
 if [[ $NATIVE -eq 0 ]]; then
     section "STEP 0: Checking Docker and available RAM"
     command -v docker &>/dev/null || die "Docker not found on PATH"
-    docker compose version &>/dev/null || docker-compose --version &>/dev/null || die "Docker Compose not found"
-command -v timeout &>/dev/null || { log "[WARN] 'timeout' not found — runs will not be time-limited"; TIMEOUT_SECS=0; }
-log "Docker OK"
-
-# Warn if free RAM is too low for the requested node count.
-# Each container has mem_limit: 1g so we need at least (MAX_NODES + 1) GB free.
-MAX_NODES="${NODE_COUNTS[-1]}"
-if command -v free &>/dev/null; then
-    FREE_MB=$(free -m | awk '/^Mem:/{print $7}')
-    NEEDED_MB=$(( (MAX_NODES + 1) * 1024 ))
-    log "RAM check: ${FREE_MB}MB free, ${NEEDED_MB}MB needed for ${MAX_NODES} nodes"
-    if [[ $FREE_MB -lt $NEEDED_MB ]]; then
-        log "[WARN] Low available RAM (${FREE_MB}MB < ${NEEDED_MB}MB)."
-        log "       Consider --nodes $(( MAX_NODES / 2 )) or closing other applications."
-        log "       Continuing anyway — expect swap-induced slowdowns."
+    docker compose version &>/dev/null || docker-compose --version &>/dev/null \
+        || die "Docker Compose not found"
+    command -v timeout &>/dev/null \
+        || { log "[WARN] 'timeout' not found — runs will not be time-limited"; TIMEOUT_SECS=0; }
+    log "Docker OK"
+    if command -v free &>/dev/null; then
+        FREE_MB=$(free -m | awk '/^Mem:/{print $7}')
+        NEEDED_MB=$(( (MAX_NODES + 1) * 1024 ))
+        log "RAM check: ${FREE_MB}MB free, ${NEEDED_MB}MB needed for ${MAX_NODES} nodes"
+        [[ $FREE_MB -lt $NEEDED_MB ]] && \
+            log "[WARN] Low RAM — expect swap-induced slowdowns."
     fi
-else
-    log "[WARN] 'free' not found — skipping RAM check"
 fi
 
-# ── Cluster helpers ───────────────────────────────────────────────────────────
+# ── Docker cluster helpers (Docker mode only) ─────────────────────────────────
 master_running() {
     local status
     status=$(docker inspect --format '{{.State.Status}}' rpic_master 2>/dev/null)
     [[ "$status" == "running" ]]
 }
-
-master_healthy() {
-    $DOCKER_CMD echo "ok" &>/dev/null
-}
-
-images_exist() {
-    if [[ $NATIVE -eq 1 ]]; then return 0; fi
-    docker image inspect pdc_project-master &>/dev/null
-}
+master_healthy() { $EXEC_PREFIX echo "ok" &>/dev/null; }
+images_exist()   { docker image inspect pdc_project-master &>/dev/null; }
 
 ensure_cluster() {
     local n="$MAX_NODES"
-
     if master_running && master_healthy; then
         local running
         running=$(docker ps --filter "name=rpic_" --filter "status=running" \
-                             --format "{{.Names}}" 2>/dev/null | wc -l)
+                     --format "{{.Names}}" 2>/dev/null | wc -l)
         if [[ $running -ge $n ]]; then
-            log "  Cluster already running and healthy ($running containers)"
-            return 0
+            log "  Cluster already running and healthy ($running containers)"; return 0
         fi
         log "  Only $running/$n containers up — starting missing workers..."
         cd "$SCRIPT_DIR"
         docker compose --profile "${n}-nodes" up -d 2>&1 | tee -a "$LOG_FILE"
-        sleep 3
-        return 0
+        sleep 3; return 0
     fi
-
     cd "$SCRIPT_DIR"
-
     if images_exist; then
         docker compose \
             --profile 2-nodes --profile 3-nodes --profile 4-nodes \
@@ -179,7 +297,6 @@ ensure_cluster() {
         docker compose --profile "${n}-nodes" up -d --build \
             2>&1 | tee -a "$LOG_FILE" || die "docker compose up --build failed"
     fi
-
     log "  Waiting for rpic_master..."
     local retries=0
     until master_healthy || [[ $retries -ge 40 ]]; do
@@ -191,108 +308,53 @@ ensure_cluster() {
     log "  Cluster ready ($n nodes)"
 }
 
-hostlist_for() {
-    local n="$1"
-    if [[ $NATIVE -eq 1 && -f "$SCRIPT_DIR/../rpi/config.env" ]]; then
-        source "$SCRIPT_DIR/../rpi/config.env"
-        local ALL_IPS=("$MASTER_IP" "$WORKER1_IP" "$WORKER2_IP" "$WORKER3_IP" "$WORKER4_IP" "$WORKER5_IP")
-        local hosts=()
-        for ((i=0; i<n; i++)); do hosts+=("${ALL_IPS[$i]}"); done
-        local IFS=','; echo "${hosts[*]}"
-    else
-        local hosts=(master)
-        for ((i=1; i<n; i++)); do hosts+=("worker$i"); done
-        local IFS=','; echo "${hosts[*]}"
-    fi
-}
-
-# ── Step 1: Start cluster ─────────────────────────────────────────────────────
-section "STEP 1: Starting cluster (${MAX_NODES} nodes)"
-cd "$SCRIPT_DIR"
-ensure_cluster
-
-log "Verifying MPI connectivity..."
-$DOCKER_CMD mpirun --allow-run-as-root -n "$MAX_NODES" \
-    --host "$(hostlist_for "$MAX_NODES")" hostname \
-    2>&1 | tee -a "$LOG_FILE" \
-    && log "Cluster verification: OK" \
-    || log "[WARN] Cluster verification failed — continuing anyway"
-fi
-
-# ── Run helper with timeout guard ─────────────────────────────────────────────
-runc() {
-    local nodes="$1" bin="$2"; shift 2
-    local args="${*:-}"
-    local hostlist
-    hostlist="$(hostlist_for "$nodes")"
-    log "  [RUN] $bin  nodes=$nodes  args=$args"
-
-    local cmd="cd /home/pi/workspace && \
-        mpirun --allow-run-as-root -n ${nodes} --host ${hostlist} \
-        /home/pi/workspace/${bin} ${args}"
-
-    if [[ "${TIMEOUT_SECS:-0}" -gt 0 ]]; then
-        timeout "$TIMEOUT_SECS" \
-            ${DOCKER_CMD:-bash -c} "$cmd" \
-            2>&1 | tee -a "$LOG_FILE"
-        local ec=${PIPESTATUS[0]}
-        if [[ $ec -eq 124 ]]; then
-            log "  [TIMEOUT] $bin exceeded ${TIMEOUT_SECS}s — skipping"
-        elif [[ $ec -ne 0 ]]; then
-            log "  [WARN] $bin exited $ec (continuing)"
-        fi
-    else
-        ${DOCKER_CMD:-bash -c} "$cmd" \
-            2>&1 | tee -a "$LOG_FILE" \
-        || log "  [WARN] $bin exited non-zero (continuing)"
-    fi
-}
-
-compile_binary() {
-    local src_stem="$1" out_name="$2"
-    log "  [COMPILE] $src_stem → $out_name"
-         ${DOCKER_CMD:-bash -c} \
-        "cd /home/pi/workspace && \
-         mkdir -p \$(dirname $out_name) && \
-         mpic++ -std=c++17 -O2 -fopenmp -I./vision/shared ${src_stem}.cpp -o ${out_name} -lm" \
+# ── Step 1: Start cluster / Prepare Pi ───────────────────────────────────────
+if [[ $NATIVE -eq 0 ]]; then
+    section "STEP 1: Starting Docker cluster (${MAX_NODES} nodes)"
+    cd "$SCRIPT_DIR"
+    ensure_cluster
+    log "Verifying MPI connectivity..."
+    $EXEC_PREFIX mpirun --allow-run-as-root -n "$MAX_NODES" \
+        --host "$(hostlist_for "$MAX_NODES")" hostname \
         2>&1 | tee -a "$LOG_FILE" \
-    || log "  [WARN] Compile failed for $src_stem"
-}
-
-
+        && log "Cluster verification: OK" \
+        || log "[WARN] Cluster verification failed — continuing anyway"
+else
+    section "STEP 1: Preparing RPi cluster (${MAX_NODES} nodes, SSH)"
+    ensure_build_on_pi
+fi
 
 # ── Step 2: Dataset management ───────────────────────────────────────────────
 section "STEP 2: Dataset management (--fix=$FIX)"
+IMAGES=()
+NEEDED_DS=("cifar-10" "tiny-imagenet-200")
+[[ $WITH_COCO -eq 1 ]] && NEEDED_DS+=("coco-val2017")
 
 if [[ -n "$CUSTOM_IMAGE" ]]; then
-    $DOCKER_CMD test -f "$CUSTOM_IMAGE" 2>/dev/null \
+    $EXEC_PREFIX test -f "$CUSTOM_IMAGE" 2>/dev/null \
         || die "Custom image not found: $CUSTOM_IMAGE"
     IMAGES=("$CUSTOM_IMAGE")
 else
-    DL_FLAGS=""
-    [[ $FIX -eq 1 ]] && DL_FLAGS="--fix"
-    [[ $WITH_COCO -eq 1 ]] && DL_FLAGS="$DL_FLAGS --coco"
-    
-    log "  Running centralized dataset downloader..."
-    ${DOCKER_CMD:-bash} /home/pi/workspace/vision/shared/download_datasets.sh $DL_FLAGS --cifar --tiny 2>&1 | tee -a "$LOG_FILE"
-    
-    CIFAR_IMG=$(${DOCKER_CMD:-bash} -c "find '$DS_ROOT/cifar-10' -name '*.jpg' -o -name '*.png' | head -1" 2>/dev/null || true)
-    TINY_IMG=$(${DOCKER_CMD:-bash} -c "find '$DS_ROOT/tiny-imagenet-200' -name '*.jpg' -o -name '*.JPEG' | head -1" 2>/dev/null || true)
-    COCO_IMG=$(${DOCKER_CMD:-bash} -c "find '$DS_ROOT/coco-val2017' -name '*.jpg' | head -1" 2>/dev/null || true)
-    
+    ensure_datasets "${NEEDED_DS[@]}"
+
+    CIFAR_IMG=$($EXEC_PREFIX bash -c "find '$DS_ROOT/cifar-10' -name '*.jpg' -o -name '*.png' | head -1" 2>/dev/null || true)
+    TINY_IMG=$($EXEC_PREFIX bash -c "find '$DS_ROOT/tiny-imagenet-200' -name '*.jpg' -o -name '*.JPEG' | head -1" 2>/dev/null || true)
+
     for img in "$CIFAR_IMG" "$TINY_IMG"; do
         [[ -n "$img" ]] && IMAGES+=("$img")
     done
-    
-    if [[ $WITH_COCO -eq 1 && -n "$COCO_IMG" ]]; then
-        IMAGES+=("$COCO_IMG")
-    elif [[ $WITH_COCO -eq 0 ]]; then
+
+    if [[ $WITH_COCO -eq 1 ]]; then
+        COCO_IMG=$($EXEC_PREFIX bash -c "find '$DS_ROOT/coco-val2017' -name '*.jpg' | head -1" 2>/dev/null || true)
+        [[ -n "$COCO_IMG" ]] && IMAGES+=("$COCO_IMG")
+    else
         log "  [SKIP] COCO-Val2017 skipped (pass --with-coco to enable)"
     fi
 
-    [[ ${#IMAGES[@]} -eq 0 ]] && die "No dataset images available — use --fix to redownload"
+    [[ ${#IMAGES[@]} -eq 0 ]] && die "No dataset images available — check datasets or run with --fix"
     log "  Running on ${#IMAGES[@]} image(s): ${IMAGES[*]}"
 fi
+
 
 # ── Step 3: Build all binaries ────────────────────────────────────────────────
 # Auto-skip if a previous build succeeded and --fix was not given.
@@ -334,8 +396,8 @@ else
     log "  Using existing binaries in workspace/$BUILD/"
 fi
 
-OUT_CONT="/home/pi/workspace/results/out"
-${DOCKER_CMD:-bash -c} "mkdir -p $OUT_CONT" 2>/dev/null || true
+OUT_CONT="$CONT_WS/results/out"
+$EXEC_PREFIX bash -c "mkdir -p $OUT_CONT" 2>/dev/null || true
 
 # ── Step 4: Serial baselines ──────────────────────────────────────────────────
 section "STEP 4: Serial Baselines"

@@ -64,6 +64,9 @@ source "$CONFIG"
 ALL_USERS=("$MASTER_USER"  "$WORKER1_USER" "$WORKER2_USER" "$WORKER3_USER" "$WORKER4_USER" "$WORKER5_USER")
 ALL_IPS=(  "$MASTER_IP"    "$WORKER1_IP"   "$WORKER2_IP"   "$WORKER3_IP"   "$WORKER4_IP"   "$WORKER5_IP")
 
+# Workspace path on the Pis — driven by config.env
+RPI_WORKSPACE_DIR="${RPI_WORKSPACE_DIR:-~/Desktop/rpi-vision-cluster/workspace}"
+
 # Build the hostfile subset for requested node count
 HOSTFILE_SUBSET=""
 for i in $(seq 0 $((NODES - 1))); do
@@ -107,7 +110,7 @@ START_TIME=$(date +%s%N)
 
 ssh "${MASTER_USER}@${MASTER_IP}" \
     "mpirun -np ${NODES} --hostfile ${TEMP_HOSTFILE} \
-     ~/workspace/build/${BINARY} ${REMOTE_IMAGE} 2>&1"
+     ${RPI_WORKSPACE_DIR}/build/${BINARY} ${REMOTE_IMAGE} 2>&1"
 
 END_TIME=$(date +%s%N)
 ELAPSED=$(( (END_TIME - START_TIME) / 1000000 ))
