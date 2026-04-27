@@ -246,111 +246,30 @@ docker exec -u pi rpic_master \
 # ── Step 2: Dataset management ───────────────────────────────────────────────
 section "STEP 2: Dataset management (--fix=$FIX)"
 
-ensure_dataset() {
-    local label="$1" ds_dir="$2" pattern="$3" retvar="$4"
-
-    if [[ $FIX -eq 1 ]]; then
-        log "  [FIX] Removing $label for redownload..."
-        docker exec -u pi rpic_master rm -rf "$ds_dir" 2>/dev/null || true
-    fi
-
-    local count
-    count=$(docker exec -u pi rpic_master bash -c \
-        "find '$ds_dir' -name '$pattern' 2>/dev/null | wc -l" 2>/dev/null || echo 0)
-
-    if [[ $count -gt 0 ]]; then
-        log "  [OK] $label already present ($count images)"
-    else
-        log "  Downloading $label..."
-        case "$label" in
-            CIFAR-10)
-                cat > /tmp/extract_cifar.py << 'PYEOF'
-import pickle, numpy as np, os, sys
-from PIL import Image
-ds_root = sys.argv[1]
-out_dir = sys.argv[2]
-src = os.path.join(ds_root, 'cifar-10-batches-py', 'data_batch_1')
-os.makedirs(out_dir, exist_ok=True)
-with open(src, 'rb') as f:
-    d = pickle.load(f, encoding='bytes')
-data, names = d[b'data'], d[b'filenames']
-for i in range(min(100, len(data))):
-    r = data[i][:1024].reshape(32, 32)
-    g = data[i][1024:2048].reshape(32, 32)
-    b = data[i][2048:].reshape(32, 32)
-    Image.fromarray(np.dstack((r, g, b))).save(
-        os.path.join(out_dir, names[i].decode()))
-print('CIFAR-10 extracted')
-PYEOF
-                docker cp /tmp/extract_cifar.py rpic_master:/tmp/extract_cifar.py
-                docker exec -u pi rpic_master bash -c "
-                    pip install -q Pillow numpy 2>/dev/null || true
-                    mkdir -p '$ds_dir'
-                    cd '$DS_ROOT'
-                    wget -q -nc --show-progress https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz 2>&1 || true
-                    tar -xzf cifar-10-python.tar.gz 2>/dev/null || true
-                    python3 /tmp/extract_cifar.py '$DS_ROOT' '$ds_dir'
-                    rm -rf '$DS_ROOT/cifar-10-batches-py' '$DS_ROOT/cifar-10-python.tar.gz' 2>/dev/null || true
-                " 2>&1 | tee -a "$LOG_FILE" || log "  [WARN] CIFAR-10 download failed"
-                ;;
-            TinyImageNet)
-                docker exec -u pi rpic_master bash -c "
-                    mkdir -p '$DS_ROOT'
-                    cd '$DS_ROOT'
-                    wget -q -nc --show-progress http://cs231n.stanford.edu/tiny-imagenet-200.zip 2>&1 || true
-                    unzip -q tiny-imagenet-200.zip 2>/dev/null || true
-                    rm -f tiny-imagenet-200.zip 2>/dev/null || true
-                " 2>&1 | tee -a "$LOG_FILE" || log "  [WARN] TinyImageNet download failed"
-                ;;
-            COCO-Val2017)
-                docker exec -u pi rpic_master bash -c "
-                    mkdir -p '$DS_ROOT'
-                    cd '$DS_ROOT'
-                    wget -q -nc --show-progress http://images.cocodataset.org/zips/val2017.zip 2>&1 || true
-                    unzip -q val2017.zip 2>/dev/null || true
-                    mv val2017 coco-val2017 2>/dev/null || true
-                    rm -f val2017.zip 2>/dev/null || true
-                " 2>&1 | tee -a "$LOG_FILE" || log "  [WARN] COCO download failed"
-                ;;
-        esac
-    fi
-
-    local img
-    img=$(docker exec -u pi rpic_master bash -c \
-        "find '$ds_dir' -name '$pattern' 2>/dev/null | sort | head -1" 2>/dev/null || true)
-
-    if [[ -z "$img" ]]; then
-        log "  [WARN] No $pattern found under $ds_dir — $label runs will be skipped"
-    else
-        log "  [IMG] $label -> $img"
-    fi
-    printf -v "$retvar" '%s' "$img"
-}
-
 if [[ -n "$CUSTOM_IMAGE" ]]; then
     log "  Custom image specified — skipping dataset management"
     docker exec -u pi rpic_master test -f "$CUSTOM_IMAGE" 2>/dev/null \
         || die "Custom image not found in container: $CUSTOM_IMAGE"
     IMAGES=("$CUSTOM_IMAGE")
 else
-    ensure_dataset "CIFAR-10"     "$DS_ROOT/cifar-10"          "*.png"  CIFAR_IMG
-    ensure_dataset "TinyImageNet" "$DS_ROOT/tiny-imagenet-200" "*.JPEG" TINY_IMG
-    if [[ -z "$TINY_IMG" ]]; then
-        ensure_dataset "TinyImageNet" "$DS_ROOT/tiny-imagenet-200" "*.jpeg" TINY_IMG
-    fi
-    if [[ -z "$TINY_IMG" ]]; then
-        ensure_dataset "TinyImageNet" "$DS_ROOT/tiny-imagenet-200" "*.jpg"  TINY_IMG
-    fi
-
+    DL_FLAGS=""
+    [[ $FIX -eq 1 ]] && DL_FLAGS="--fix"
+    [[ $WITH_COCO -eq 1 ]] && DL_FLAGS="$DL_FLAGS --coco"
+    
+    log "  Running centralized dataset downloader..."
+    docker exec -u pi rpic_master bash /home/pi/workspace/vision/shared/download_datasets.sh $DL_FLAGS --cifar --tiny 2>&1 | tee -a "$LOG_FILE"
+    
+    CIFAR_IMG=$(docker exec -u pi rpic_master bash -c "find '$DS_ROOT/cifar-10' -name '*.jpg' -o -name '*.png' | head -1" 2>/dev/null || true)
+    TINY_IMG=$(docker exec -u pi rpic_master bash -c "find '$DS_ROOT/tiny-imagenet-200' -name '*.jpg' -o -name '*.JPEG' | head -1" 2>/dev/null || true)
+    COCO_IMG=$(docker exec -u pi rpic_master bash -c "find '$DS_ROOT/coco-val2017' -name '*.jpg' | head -1" 2>/dev/null || true)
+    
     for img in "$CIFAR_IMG" "$TINY_IMG"; do
         [[ -n "$img" ]] && IMAGES+=("$img")
     done
-
-    # COCO is large (~6 GB download, slow to process) — opt-in only
-    if [[ $WITH_COCO -eq 1 ]]; then
-        ensure_dataset "COCO-Val2017" "$DS_ROOT/coco-val2017" "*.jpg" COCO_IMG
-        [[ -n "$COCO_IMG" ]] && IMAGES+=("$COCO_IMG")
-    else
+    
+    if [[ $WITH_COCO -eq 1 && -n "$COCO_IMG" ]]; then
+        IMAGES+=("$COCO_IMG")
+    elif [[ $WITH_COCO -eq 0 ]]; then
         log "  [SKIP] COCO-Val2017 skipped (pass --with-coco to enable)"
     fi
 

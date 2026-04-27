@@ -245,86 +245,23 @@ if [[ -n "$CUSTOM_IMAGE" ]]; then
     RES_IMG="$CUSTOM_IMAGE"
     log "  Using custom image: $RES_IMG"
 else
-    # ── Ensure BSDS500 (primary) ──────────────────────────────────────────────
-    if [[ $FIX -eq 1 ]]; then
-        log "  [FIX] Removing BSDS500 for redownload..."
-        docker exec -u pi rpic_master rm -rf "$DS_ROOT/BSDS500" 2>/dev/null || true
-    fi
+    # ── Ensure Dataset ──────────────────────────────────────────────
+    DL_FLAGS=""
+    [[ $FIX -eq 1 ]] && DL_FLAGS="--fix"
+    [[ $WITH_COCO -eq 1 ]] && DL_FLAGS="$DL_FLAGS --coco"
 
-    BSDS_DIR="$DS_ROOT/BSDS500/data/images/test"
-    BSDS_OK=0
-    if docker exec -u pi rpic_master test -d "$BSDS_DIR" 2>/dev/null && \
-       [[ $(docker exec -u pi rpic_master bash -c \
-           "find '$BSDS_DIR' -name '*.jpg' 2>/dev/null | wc -l") -gt 0 ]]; then
-        log "  BSDS500 found at $BSDS_DIR"
-        BSDS_OK=1
+    log "  Running centralized dataset downloader..."
+    docker exec -u pi rpic_master bash /home/pi/workspace/vision/shared/download_datasets.sh $DL_FLAGS --bsds 1 2>&1 | tee -a "$LOG_FILE"
+
+    BSDS_DIR="$DS_ROOT/BSDS500/images"
+    RES_IMG=$(docker exec -u pi rpic_master bash -c \
+        "find '$BSDS_DIR' -name '*.jpg' 2>/dev/null | sort | head -1" \
+        2>/dev/null || true)
+        
+    if [[ -n "$RES_IMG" ]]; then
+        log "  Using BSDS500 image: $RES_IMG"
     else
-        FIRST=$(docker exec -u pi rpic_master bash -c \
-            "find '$DS_ROOT/BSDS500' -name '*.jpg' 2>/dev/null | sort | head -1" \
-            2>/dev/null || true)
-        if [[ -n "$FIRST" ]]; then
-            BSDS_DIR=$(docker exec -u pi rpic_master dirname "$FIRST")
-            log "  BSDS500 images found at: $BSDS_DIR"
-            BSDS_OK=1
-        fi
-    fi
-
-    if [[ $BSDS_OK -eq 0 ]]; then
-        log "  BSDS500 not found — downloading via kagglehub..."
-        cat > /tmp/download_bsds.py << PYEOF
-import kagglehub, shutil, os
-print('  Downloading BSDS500 from Kaggle...')
-path = kagglehub.dataset_download('balraj98/berkeley-segmentation-dataset-500-bsds500')
-print(f'  Downloaded to: {path}')
-dst = '$DS_ROOT/BSDS500'
-if os.path.exists(dst):
-    shutil.rmtree(dst)
-shutil.copytree(path, dst)
-print('  BSDS500 ready at', dst)
-PYEOF
-        docker cp /tmp/download_bsds.py rpic_master:/tmp/download_bsds.py
-        docker exec -u pi rpic_master bash -c "
-            pip install -q kagglehub scipy 2>/dev/null || true
-            python3 /tmp/download_bsds.py
-        " 2>&1 | tee -a "$LOG_FILE" && BSDS_OK=1 || true
-
-        if [[ $BSDS_OK -eq 1 ]]; then
-            FIRST=$(docker exec -u pi rpic_master bash -c \
-                "find '$DS_ROOT/BSDS500' -name '*.jpg' 2>/dev/null | sort | head -1" \
-                2>/dev/null || true)
-            [[ -n "$FIRST" ]] && BSDS_DIR=$(docker exec -u pi rpic_master dirname "$FIRST")
-        fi
-    fi
-
-    if [[ $BSDS_OK -eq 1 ]]; then
-        RES_IMG=$(docker exec -u pi rpic_master bash -c \
-            "find '$BSDS_DIR' -name '*.jpg' 2>/dev/null | sort | head -1" \
-            2>/dev/null || true)
-        [[ -n "$RES_IMG" ]] && log "  Using BSDS500 image: $RES_IMG"
-    fi
-
-    # ── COCO fallback — opt-in only ───────────────────────────────────────────
-    if [[ -z "$RES_IMG" ]]; then
-        if [[ $WITH_COCO -eq 0 ]]; then
-            die "BSDS500 unavailable and COCO fallback is disabled. Use --fix to redownload BSDS500, --image to specify an image, or --with-coco to allow the COCO fallback (~6GB download)."
-        fi
         log "  BSDS500 unavailable — trying COCO fallback (--with-coco)..."
-        if [[ $FIX -eq 1 ]]; then
-            docker exec -u pi rpic_master rm -rf "$DS_ROOT/coco-val2017" 2>/dev/null || true
-        fi
-        COCO_COUNT=$(docker exec -u pi rpic_master bash -c \
-            "find '$DS_ROOT/coco-val2017' -name '*.jpg' 2>/dev/null | wc -l" \
-            2>/dev/null || echo 0)
-        if [[ $COCO_COUNT -eq 0 ]]; then
-            log "  Downloading COCO Val2017 (~6GB)..."
-            docker exec -u pi rpic_master bash -c "
-                mkdir -p $DS_ROOT && cd $DS_ROOT
-                wget -q -nc --show-progress http://images.cocodataset.org/zips/val2017.zip 2>&1 || true
-                unzip -q val2017.zip 2>/dev/null || true
-                mv val2017 coco-val2017 2>/dev/null || true
-                rm -f val2017.zip 2>/dev/null || true
-            " 2>&1 | tee -a "$LOG_FILE" || true
-        fi
         COCO_IMG=$(docker exec -u pi rpic_master bash -c \
             "find '$DS_ROOT/coco-val2017' -name '*.jpg' 2>/dev/null | sort | head -1" \
             2>/dev/null || true)

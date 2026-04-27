@@ -251,66 +251,14 @@ docker exec -u pi rpic_master \
 # ── Step 2: BSDS500 dataset ───────────────────────────────────────────────────
 section "STEP 2: BSDS500 Dataset Management (--fix=$FIX)"
 
-if [[ $FIX -eq 1 ]]; then
-    log "  [FIX] Removing BSDS500 dataset for redownload..."
-    docker exec -u pi rpic_master rm -rf "$DS_ROOT/BSDS500" 2>/dev/null || true
-fi
+DL_FLAGS=""
+[[ $FIX -eq 1 ]] && DL_FLAGS="--fix"
 
-BSDS_OK=0
+log "  Running centralized dataset downloader..."
+docker exec -u pi rpic_master bash /home/pi/workspace/vision/shared/download_datasets.sh $DL_FLAGS --bsds $BSDS_N 2>&1 | tee -a "$LOG_FILE"
 
-BSDS_DIR="$DS_ROOT/BSDS500/data/images/test"
-if docker exec -u pi rpic_master test -d "$BSDS_DIR" 2>/dev/null && \
-   [[ $(docker exec -u pi rpic_master bash -c "find '$BSDS_DIR' -name '*.jpg' 2>/dev/null | wc -l") -gt 0 ]]; then
-    log "  BSDS500 found at $BSDS_DIR"
-    BSDS_OK=1
-else
-    FIRST=$(docker exec -u pi rpic_master bash -c \
-        "find '$DS_ROOT/BSDS500' -name '*.jpg' 2>/dev/null | sort | head -1" 2>/dev/null || true)
-    if [[ -n "$FIRST" ]]; then
-        BSDS_DIR=$(docker exec -u pi rpic_master dirname "$FIRST")
-        log "  BSDS500 images found at: $BSDS_DIR"
-        BSDS_OK=1
-    fi
-fi
-
-if [[ $BSDS_OK -eq 0 ]]; then
-    log "  BSDS500 not found — downloading via kagglehub..."
-
-    cat > /tmp/download_bsds.py << PYEOF
-import kagglehub, shutil, os
-print('  Downloading BSDS500 from Kaggle...')
-path = kagglehub.dataset_download('balraj98/berkeley-segmentation-dataset-500-bsds500')
-print(f'  Downloaded to: {path}')
-dst = '$DS_ROOT/BSDS500'
-if os.path.exists(dst):
-    shutil.rmtree(dst)
-shutil.copytree(path, dst)
-print('  BSDS500 ready at', dst)
-PYEOF
-
-    docker cp /tmp/download_bsds.py rpic_master:/tmp/download_bsds.py
-    docker exec -u pi rpic_master bash -c "
-        pip install -q kagglehub scipy 2>/dev/null || true
-        python3 /tmp/download_bsds.py
-    " 2>&1 | tee -a "$LOG_FILE" && BSDS_OK=1 || die "BSDS500 download failed — cannot continue"
-
-    FIRST=$(docker exec -u pi rpic_master bash -c \
-        "find '$DS_ROOT/BSDS500' -name '*.jpg' 2>/dev/null | sort | head -1" 2>/dev/null || true)
-    if [[ -n "$FIRST" ]]; then
-        BSDS_DIR=$(docker exec -u pi rpic_master dirname "$FIRST")
-        log "  Images at: $BSDS_DIR"
-    else
-        die "BSDS500 download succeeded but no .jpg images found"
-    fi
-fi
-
-BSDS_GT_DIR="${BSDS_DIR/data\/images/data\/groundTruth}"
-if ! docker exec -u pi rpic_master test -d "$BSDS_GT_DIR" 2>/dev/null; then
-    FOUND_GT=$(docker exec -u pi rpic_master bash -c \
-        "find '$DS_ROOT/BSDS500' -type d -name test | grep groundTruth | head -1" \
-        2>/dev/null || true)
-    [[ -n "$FOUND_GT" ]] && BSDS_GT_DIR="$FOUND_GT"
-fi
+BSDS_DIR="$DS_ROOT/BSDS500/images"
+BSDS_GT_DIR="$DS_ROOT/BSDS500/groundTruth_png"
 
 mkdir -p "$WS/results"
 BSDS_LIST_HOST="$WS/results/bsds_img_list.txt"
@@ -485,18 +433,10 @@ section "STEP 10: Generating BSDS500 Report"
 GT_ARG=""
 if [[ $GT_AVAILABLE -eq 1 ]]; then
     mkdir -p "$WS/results/gt"
-    # Strip everything from /data/ onward to get base, then append /data
-    _bsds_base=$(docker exec -u pi rpic_master bash -c \
-        "echo '$BSDS_GT_DIR' | sed 's|/data/.*||'" 2>/dev/null \
-        || echo "$DS_ROOT/BSDS500")
-    BSDS500_DATA_ROOT="${_bsds_base}/data"
-    GT_REL=$(docker exec -u pi rpic_master bash -c \
-        "echo '$BSDS_GT_DIR' | sed 's|.*BSDS500/data/||'" 2>/dev/null \
-        || echo "groundTruth/test")
     docker exec -u pi rpic_master bash -c \
-        "cd '$BSDS500_DATA_ROOT' && tar cf - '$GT_REL'" \
+        "cd '$DS_ROOT/BSDS500' && tar cf - groundTruth_png" \
         | tar xf - -C "$WS/results/gt/" 2>/dev/null || true
-    GT_ARG="--gt-dir $WS/results/gt/$GT_REL"
+    GT_ARG="--gt-dir $WS/results/gt/groundTruth_png"
 fi
 
 if command -v python3 &>/dev/null; then
