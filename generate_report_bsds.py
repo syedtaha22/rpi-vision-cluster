@@ -11,7 +11,7 @@ Parses analysis_bsds.log (from run_analysis_bsds.sh) and produces:
   ├── fig5_spatial_arch3_speedup.png         Arch3 for Sobel/Canny/LoG
   ├── fig6_all_archs_<filter>.png            All archs per filter (4 files)
   ├── fig7_amdahl_comparison.png             Fitted f per (filter, arch)
-  ├── fig8_brents_law.png                    Brent's Law 2×2 grid
+  ├── fig8_brents_law.png                    Brent's Law 2x2 grid
   ├── fig9_metrics_jaccard_dice_ssim.png     Quality metrics combined
   ├── fig10_recon_<filter>.png               Filter-organized output grid (4 files)
   ├── fig11_arch_mean_time.png               Mean time per arch per filter

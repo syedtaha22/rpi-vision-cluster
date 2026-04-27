@@ -34,11 +34,11 @@ rpi-vision-cluster/
 │   ├── deploy.sh                     # Compilation & binary distribution
 │   ├── sync_images.sh                # Dataset syncing to nodes
 │   ├── run_game.sh                   # Interactive MPI smoke test
+│   ├── game.cpp, play_game.sh        # Number guessing game code
 │   └── verify.sh                     # Cluster health & diagnostics
 │
 ├── _dev/                             # Development tools & scratchpad (not pushed)
 │   ├── rough_plots.py                # Visual style guide reference
-│   ├── game.cpp, play_game.sh        # Number guessing game code
 │   └── workspace_to_md.py            # Utility scripts
 │
 └── workspace/                        # Mounted into every container at /home/pi/workspace/

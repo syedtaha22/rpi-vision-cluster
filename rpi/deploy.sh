@@ -67,8 +67,8 @@ if [[ $SKIP_SYNC -eq 0 ]]; then
 
     # Also copy game files
     info "Copying game files → master"
-    scp "${REPO_ROOT}/_dev/game.cpp" "${MASTER_USER}@${MASTER_IP}:~/game.cpp"
-    scp "${REPO_ROOT}/_dev/play_game.sh" "${MASTER_USER}@${MASTER_IP}:~/play_game.sh"
+    scp "${REPO_ROOT}/rpi/game.cpp" "${MASTER_USER}@${MASTER_IP}:~/game.cpp"
+    scp "${REPO_ROOT}/rpi/play_game.sh" "${MASTER_USER}@${MASTER_IP}:~/play_game.sh"
     ssh "${MASTER_USER}@${MASTER_IP}" "chmod +x ~/play_game.sh"
     success "game files copied"
 else
