@@ -21,6 +21,8 @@ int main(int argc, char** argv) {
         cout << "Usage: " << argv[0] << " <image_path>\n";
         return 1;
     }
+    const char* out_path = (argc > 2) ? argv[argc-1] : "fft_arch2_out.png";
+
     omp_set_num_threads(2);
     
     string img_path = argv[1];
@@ -109,7 +111,7 @@ int main(int argc, char** argv) {
         float mag = sqrt(data[i].real() * data[i].real() + data[i].imag() * data[i].imag());
         out[i] = (unsigned char)(255.0f * mag / max_edge);
     }
-    stbi_write_png("fft_arch2_out.png", new_w, new_h, 1, out.data(), new_w);
+    stbi_write_png(out_path, new_w, new_h, 1, out.data(), new_w);
     
     return 0;
 }

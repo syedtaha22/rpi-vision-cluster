@@ -17,26 +17,33 @@
 #    ./resilience_analysis.sh --nodes 4             # min 3 required
 #    ./resilience_analysis.sh --image /path/img.png # skip dataset check, use this image
 #    ./resilience_analysis.sh --timeout 120         # per-test timeout
+#    ./resilience_analysis.sh --with-coco           # allow COCO fallback if BSDS500 missing
 # =============================================================================
 
 set -uo pipefail
 
+# ── Paths (must come first so BUILD_SENTINEL can reference SCRIPT_DIR) ────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Sentinel file — written after a successful build, cleared by --fix
+BUILD_SENTINEL="$SCRIPT_DIR/.build_ok_resilience"
+
 # ── Defaults ──────────────────────────────────────────────────────────────────
-RESILIENCE_NODES=6      # must be ≥ 3
+RESILIENCE_NODES=6
 SKIP_BUILD=0
 QUICK=0
-FIX=0               # --fix: wipe + redownload datasets
-VERIFY=0            # --verify: skip cluster/run, just regenerate report from existing log
+FIX=0
+VERIFY=0
+NATIVE=0
+WITH_COCO=0           # opt-in: --with-coco enables COCO fallback download
 CUSTOM_IMAGE=""
 TIMEOUT_SECS=120
 
-# Container workspace root (fixed by docker-compose bind-mount)
 CONT_WS="/home/pi/workspace"
 DS_ROOT="$CONT_WS/vision/datasets"
 
-# Resolved dynamically in Step 2
 BSDS_DIR=""
-COCO_IMG=""  
+COCO_IMG=""
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -47,6 +54,8 @@ while [[ $# -gt 0 ]]; do
         --quick)      QUICK=1;                 shift   ;;
         --fix)        FIX=1;                   shift   ;;
         --verify)     VERIFY=1;                shift   ;;
+        --native)     NATIVE=1;                shift   ;;
+        --with-coco)  WITH_COCO=1;             shift   ;;
         --timeout)    TIMEOUT_SECS="$2";       shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -55,15 +64,34 @@ done
 [[ $RESILIENCE_NODES -lt 3 ]] && { echo "[ERROR] --nodes must be ≥ 3"; exit 1; }
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="$SCRIPT_DIR/report_resilience"
 LOG_FILE="$OUT_DIR/analysis_resilience.log"
-WS="$SCRIPT_DIR/workspace"
+WS="$SCRIPT_DIR/../workspace"
 BUILD="build"
+DS_ROOT="$CONT_WS/vision/datasets"
+[[ $NATIVE -eq 1 ]] && DS_ROOT="$WS/vision/datasets"
+
+# EXEC_PREFIX: Docker mode = docker exec; Native mode = ssh to master Pi
+EXEC_PREFIX="docker exec -u pi rpic_master"
+if [[ $NATIVE -eq 1 ]]; then
+    RPI_CONFIG="$SCRIPT_DIR/../rpi/config.env"
+    if [[ ! -f "$RPI_CONFIG" ]] || grep -q "__FILL_IN__" "$RPI_CONFIG" 2>/dev/null; then
+        echo "  config.env missing — running gen_config.sh..."
+        bash "$SCRIPT_DIR/../rpi/gen_config.sh" \
+            || { echo "[FATAL] gen_config.sh failed"; exit 1; }
+    fi
+    source "$RPI_CONFIG"
+    NATIVE_WS=$(ssh "${MASTER_USER}@${MASTER_IP}" "echo ${RPI_WORKSPACE_DIR}" 2>/dev/null) \
+        || { echo "[FATAL] Cannot SSH to ${MASTER_USER}@${MASTER_IP}"; exit 1; }
+    CONT_WS="$NATIVE_WS"
+    DS_ROOT="$NATIVE_WS/vision/datasets"
+    EXEC_PREFIX="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new ${MASTER_USER}@${MASTER_IP}"
+fi
 
 mkdir -p "$OUT_DIR" "$WS/results/resilience"
 
-# ── Verify shortcut: just regenerate report from existing log ─────────────────
+
+# ── Verify shortcut ───────────────────────────────────────────────────────────
 if [[ $VERIFY -eq 1 ]]; then
     if [[ ! -f "$LOG_FILE" ]]; then
         echo "[VERIFY] No log found at $LOG_FILE — run without --verify first"
@@ -85,17 +113,32 @@ section() { log ""; log "=======================================================
 die()     { echo "[FATAL] $*" >&2; exit 1; }
 
 log "RPI Vision Cluster — Resilience & Bully Election Analysis"
-log "Started : $(date)"
-log "Nodes   : $RESILIENCE_NODES"
-log "Timeout : ${TIMEOUT_SECS}s per test"
-log "Out dir : $OUT_DIR"
+log "Started   : $(date)"
+log "Nodes     : $RESILIENCE_NODES"
+log "Timeout   : ${TIMEOUT_SECS}s per test"
+log "Out dir   : $OUT_DIR"
+log "COCO fallback: $([ $WITH_COCO -eq 1 ] && echo enabled || echo disabled -- use --with-coco to enable)"
 
-# ── Step 0: Docker check ──────────────────────────────────────────────────────
-section "STEP 0: Checking Docker"
-command -v docker &>/dev/null || die "Docker not found on PATH"
-docker compose version &>/dev/null || docker-compose --version &>/dev/null || die "Docker Compose not found"
+# ── Step 0: Docker + RAM check ────────────────────────────────────────────────
+if [[ $NATIVE -eq 0 ]]; then
+    section "STEP 0: Checking Docker and available RAM"
+    command -v docker &>/dev/null || die "Docker not found on PATH"
+    docker compose version &>/dev/null || docker-compose --version &>/dev/null || die "Docker Compose not found"
 command -v timeout &>/dev/null || { log "[WARN] 'timeout' not found — tests will not be time-limited"; TIMEOUT_SECS=0; }
 log "Docker OK"
+
+if command -v free &>/dev/null; then
+    FREE_MB=$(free -m | awk '/^Mem:/{print $7}')
+    NEEDED_MB=$(( (RESILIENCE_NODES + 1) * 1024 ))
+    log "RAM check: ${FREE_MB}MB free, ${NEEDED_MB}MB needed for ${RESILIENCE_NODES} nodes"
+    if [[ $FREE_MB -lt $NEEDED_MB ]]; then
+        log "[WARN] Low available RAM (${FREE_MB}MB < ${NEEDED_MB}MB)."
+        log "       Consider --nodes $(( RESILIENCE_NODES / 2 )) or closing other applications."
+        log "       Continuing anyway — expect swap-induced slowdowns."
+    fi
+else
+    log "[WARN] 'free' not found — skipping RAM check"
+fi
 
 # ── Cluster helpers ───────────────────────────────────────────────────────────
 master_running() {
@@ -109,42 +152,35 @@ master_healthy() {
 }
 
 images_exist() {
-    docker image inspect pdc_project-master &>/dev/null
-}
+images_exist()   { docker image inspect pdc_project-master &>/dev/null; }
 
 ensure_cluster() {
     local n="$RESILIENCE_NODES"
-
     if master_running && master_healthy; then
         local running
         running=$(docker ps --filter "name=rpic_" --filter "status=running" \
-                             --format "{{.Names}}" 2>/dev/null | wc -l)
+                     --format "{{.Names}}" 2>/dev/null | wc -l)
         if [[ $running -ge $n ]]; then
-            log "  Cluster already running ($running containers)"
-            return 0
+            log "  Cluster already running ($running containers)"; return 0
         fi
         log "  Only $running/$n containers — starting missing workers..."
         cd "$SCRIPT_DIR"
         docker compose --profile "${n}-nodes" up -d 2>&1 | tee -a "$LOG_FILE"
-        sleep 3
-        return 0
+        sleep 3; return 0
     fi
-
     cd "$SCRIPT_DIR"
-
     if images_exist; then
-    docker compose \
-        --profile 2-nodes --profile 3-nodes --profile 4-nodes \
-        --profile 5-nodes --profile 6-nodes \
-        down --remove-orphans 2>&1 | tail -3 | tee -a "$LOG_FILE"
-    docker compose --profile "${n}-nodes" up -d \
-        2>&1 | tee -a "$LOG_FILE" || die "docker compose up failed"
+        docker compose \
+            --profile 2-nodes --profile 3-nodes --profile 4-nodes \
+            --profile 5-nodes --profile 6-nodes \
+            down --remove-orphans 2>&1 | tail -3 | tee -a "$LOG_FILE"
+        docker compose --profile "${n}-nodes" up -d \
+            2>&1 | tee -a "$LOG_FILE" || die "docker compose up failed"
     else
         log "  No images — building (~5-10 min first run)..."
         docker compose --profile "${n}-nodes" up -d --build \
             2>&1 | tee -a "$LOG_FILE" || die "docker compose up --build failed"
     fi
-
     log "  Waiting for rpic_master..."
     local retries=0
     until master_healthy || [[ $retries -ge 40 ]]; do
@@ -156,11 +192,76 @@ ensure_cluster() {
     log "  Cluster ready ($n nodes)"
 }
 
-hostlist_for() {
-    local n="$1" hosts=(master)
-    for ((i=1; i<n; i++)); do hosts+=("worker$i"); done
-    local IFS=','; echo "${hosts[*]}"
+# ── Ensure datasets exist (laptop or Pi) ──────────────────────────────────────
+ensure_datasets() {
+    local LOCAL_DS="$WS/vision/datasets"
+    local -a needed=("$@")
+
+    if [[ $NATIVE -eq 1 ]]; then
+        # Native mode: check Pi, rsync from laptop if missing
+        local REMOTE_DS="$NATIVE_WS/vision/datasets"
+        $EXEC_PREFIX mkdir -p "$REMOTE_DS" 2>/dev/null || true
+        for ds in "${needed[@]}"; do
+            if ! $EXEC_PREFIX test -d "$REMOTE_DS/$ds" 2>/dev/null; then
+                log "  Dataset '$ds' missing on Pi — pushing from laptop..."
+                if [[ -d "$LOCAL_DS/$ds" ]]; then
+                    rsync -az --info=progress2 \
+                        "$LOCAL_DS/$ds/" \
+                        "${MASTER_USER}@${MASTER_IP}:${REMOTE_DS}/${ds}/" \
+                        2>&1 | tee -a "$LOG_FILE"
+                    log "  ✓ '$ds' pushed to Pi"
+                else
+                    log "  [WARN] '$ds' also missing locally."
+                    log "         Run Docker mode first to download: ./analysis/resilience_analysis.sh --fix"
+                fi
+            else
+                log "  Dataset '$ds': already on Pi ✓"
+            fi
+        done
+    else
+        # Docker mode: run centralized downloader inside container
+        local DL_FLAGS=""
+        [[ $FIX -eq 1 ]] && DL_FLAGS="--fix"
+        [[ $WITH_COCO -eq 1 ]] && DL_FLAGS="$DL_FLAGS --coco"
+        local needed_flags=""
+        for ds in "${needed[@]}"; do
+            case "$ds" in
+                BSDS500)      needed_flags="$needed_flags --bsds 1" ;;
+                coco-val2017) needed_flags="$needed_flags --coco" ;;
+            esac
+        done
+        $EXEC_PREFIX bash "$CONT_WS/vision/shared/download_datasets.sh" \
+            $DL_FLAGS $needed_flags 2>&1 | tee -a "$LOG_FILE"
+    fi
 }
+
+# ── ensure_build_on_pi: deploy source + compile if binaries missing ───────────
+ensure_build_on_pi() {
+    if [[ $FIX -eq 1 ]] || ! $EXEC_PREFIX test -f "$NATIVE_WS/build/sobel_arch1" 2>/dev/null; then
+        log "  Binaries missing on Pi (or --fix) — running deploy..."
+        bash "$SCRIPT_DIR/../rpi/deploy.sh" 2>&1 | tee -a "$LOG_FILE"
+        log "  ✓ Deploy complete"
+    else
+        log "  Binaries already on Pi ✓"
+        SKIP_BUILD=1
+    fi
+}
+
+# ── Step 1: Start cluster / Prepare Pi ───────────────────────────────────────
+if [[ $NATIVE -eq 0 ]]; then
+    section "STEP 1: Starting cluster (${RESILIENCE_NODES} nodes)"
+    cd "$SCRIPT_DIR"
+    ensure_cluster
+    log "Verifying MPI connectivity..."
+    $EXEC_PREFIX mpirun --allow-run-as-root -n "$RESILIENCE_NODES" \
+        --host "$(hostlist_for "$RESILIENCE_NODES")" hostname \
+        2>&1 | tee -a "$LOG_FILE" \
+        && log "Cluster verification: OK" \
+        || log "[WARN] Cluster verification failed — continuing anyway"
+else
+    section "STEP 1: Preparing RPi cluster (${RESILIENCE_NODES} nodes, SSH)"
+    ensure_build_on_pi
+fi
 
 # ── Run helper with timeout guard ─────────────────────────────────────────────
 runc() {
@@ -170,13 +271,13 @@ runc() {
     hostlist="$(hostlist_for "$nodes")"
     log "  [RUN] $bin  nodes=$nodes  args=$args"
 
-    local cmd="cd /home/pi/workspace && \
+    local cmd="cd $CONT_WS && \
         mpirun --allow-run-as-root -n ${nodes} --host ${hostlist} \
-        /home/pi/workspace/${bin} ${args}"
+        ${CONT_WS}/${bin} ${args}"
 
     if [[ "${TIMEOUT_SECS:-0}" -gt 0 ]]; then
         timeout "$TIMEOUT_SECS" \
-            docker exec -u pi rpic_master bash -c "$cmd" \
+            $EXEC_PREFIX bash -c "$cmd" \
             2>&1 | tee -a "$LOG_FILE"
         local ec=${PIPESTATUS[0]}
         if [[ $ec -eq 124 ]]; then
@@ -185,7 +286,7 @@ runc() {
             log "  [WARN] $bin exited $ec (continuing)"
         fi
     else
-        docker exec -u pi rpic_master bash -c "$cmd" \
+        $EXEC_PREFIX bash -c "$cmd" \
             2>&1 | tee -a "$LOG_FILE" \
         || log "  [WARN] $bin exited non-zero (continuing)"
     fi
@@ -194,114 +295,41 @@ runc() {
 compile_binary() {
     local src_stem="$1" out_name="$2"
     log "  [COMPILE] $src_stem → $out_name"
-    docker exec -u pi rpic_master bash -c \
-        "cd /home/pi/workspace && \
+    $EXEC_PREFIX bash -c \
+        "cd $CONT_WS && \
          mkdir -p \$(dirname $out_name) && \
          mpic++ -std=c++17 -O2 -fopenmp -I./vision/shared ${src_stem}.cpp -o ${out_name} -lm" \
         2>&1 | tee -a "$LOG_FILE" \
     || log "  [WARN] Compile failed for $src_stem"
 }
 
-# ── Step 1: Start cluster ─────────────────────────────────────────────────────
-section "STEP 1: Starting cluster ($RESILIENCE_NODES nodes)"
-cd "$SCRIPT_DIR"
-ensure_cluster
-
-log "Verifying MPI connectivity..."
-docker exec -u pi rpic_master \
-    mpirun --allow-run-as-root -n "$RESILIENCE_NODES" \
-    --host "$(hostlist_for "$RESILIENCE_NODES")" hostname \
-    2>&1 | tee -a "$LOG_FILE" \
-    && log "Cluster verification: OK" \
-    || log "[WARN] Cluster verification failed — continuing anyway"
-
 # ── Step 2: Select test image ─────────────────────────────────────────────────
 section "STEP 2: Dataset management + test image selection (--fix=$FIX)"
 RES_IMG=""
 
 if [[ -n "$CUSTOM_IMAGE" ]]; then
-    docker exec -u pi rpic_master test -f "$CUSTOM_IMAGE" 2>/dev/null \
+    $EXEC_PREFIX test -f "$CUSTOM_IMAGE" 2>/dev/null \
         || die "Custom image not found in container: $CUSTOM_IMAGE"
     RES_IMG="$CUSTOM_IMAGE"
     log "  Using custom image: $RES_IMG"
 else
-    # ── Ensure BSDS500 (primary) ──────────────────────────────────────────────
-    if [[ $FIX -eq 1 ]]; then
-        log "  [FIX] Removing BSDS500 for redownload..."
-        docker exec -u pi rpic_master rm -rf "$DS_ROOT/BSDS500" 2>/dev/null || true
-    fi
+    # ── Ensure Dataset ──────────────────────────────────────────────
+    NEEDED_DS=("BSDS500")
+    [[ $WITH_COCO -eq 1 ]] && NEEDED_DS+=("coco-val2017")
+    ensure_datasets "${NEEDED_DS[@]}"
 
-    BSDS_DIR="$DS_ROOT/BSDS500/data/images/test"
-    BSDS_OK=0
-    if docker exec -u pi rpic_master test -d "$BSDS_DIR" 2>/dev/null && \
-       [[ $(docker exec -u pi rpic_master bash -c \
-           "find '$BSDS_DIR' -name '*.jpg' 2>/dev/null | wc -l") -gt 0 ]]; then
-        log "  BSDS500 found at $BSDS_DIR"
-        BSDS_OK=1
+    # ensure_datasets handles the downloading/syncing now.
+
+    BSDS_DIR="$DS_ROOT/BSDS500/images"
+    RES_IMG=$($EXEC_PREFIX bash -c \
+        "find '$BSDS_DIR' -name '*.jpg' 2>/dev/null | sort | head -1" \
+        2>/dev/null || true)
+        
+    if [[ -n "$RES_IMG" ]]; then
+        log "  Using BSDS500 image: $RES_IMG"
     else
-        # Search anywhere under BSDS500
-        FIRST=$(docker exec -u pi rpic_master bash -c \
-            "find '$DS_ROOT/BSDS500' -name '*.jpg' 2>/dev/null | sort | head -1" \
-            2>/dev/null || true)
-        if [[ -n "$FIRST" ]]; then
-            BSDS_DIR=$(docker exec -u pi rpic_master dirname "$FIRST")
-            log "  BSDS500 images found at: $BSDS_DIR"
-            BSDS_OK=1
-        fi
-    fi
-
-if [[ $BSDS_OK -eq 0 ]]; then
-    log "  BSDS500 not found — downloading via kagglehub..."
-    cat > /tmp/download_bsds.py << PYEOF
-import kagglehub, shutil, os
-print('  Downloading BSDS500 from Kaggle...')
-path = kagglehub.dataset_download('balraj98/berkeley-segmentation-dataset-500-bsds500')
-print(f'  Downloaded to: {path}')
-dst = '$DS_ROOT/BSDS500'
-if os.path.exists(dst):
-    shutil.rmtree(dst)
-shutil.copytree(path, dst)
-print('  BSDS500 ready at', dst)
-PYEOF
-    docker cp /tmp/download_bsds.py rpic_master:/tmp/download_bsds.py
-    docker exec -u pi rpic_master bash -c "
-        pip install -q kagglehub scipy 2>/dev/null || true
-        python3 /tmp/download_bsds.py
-    " 2>&1 | tee -a "$LOG_FILE" && BSDS_OK=1 || true
-
-    if [[ $BSDS_OK -eq 1 ]]; then
-        FIRST=$(docker exec -u pi rpic_master bash -c \
-            "find '$DS_ROOT/BSDS500' -name '*.jpg' 2>/dev/null | sort | head -1" \
-            2>/dev/null || true)
-        [[ -n "$FIRST" ]] && BSDS_DIR=$(docker exec -u pi rpic_master dirname "$FIRST")
-    fi
-fi
-    if [[ $BSDS_OK -eq 1 ]]; then
-        RES_IMG=$(docker exec -u pi rpic_master bash -c \
-            "find '$BSDS_DIR' -name '*.jpg' 2>/dev/null | sort | head -1" \
-            2>/dev/null || true)
-        [[ -n "$RES_IMG" ]] && log "  Using BSDS500 image: $RES_IMG"
-    fi
-
-    # ── COCO fallback ─────────────────────────────────────────────────────────
-    if [[ -z "$RES_IMG" ]]; then
-        log "  BSDS500 unavailable — trying COCO fallback..."
-        if [[ $FIX -eq 1 ]]; then
-            docker exec -u pi rpic_master rm -rf "$DS_ROOT/coco-val2017" 2>/dev/null || true
-        fi
-        COCO_COUNT=$(docker exec -u pi rpic_master bash -c \
-            "find '$DS_ROOT/coco-val2017' -name '*.jpg' 2>/dev/null | wc -l" \
-            2>/dev/null || echo 0)
-        if [[ $COCO_COUNT -eq 0 ]]; then
-            log "  Downloading COCO Val2017..."
-            docker exec -u pi rpic_master bash -c "
-mkdir -p $DS_ROOT && cd $DS_ROOT
-wget -q -nc --show-progress http://images.cocodataset.org/zips/val2017.zip 2>&1 || true
-unzip -q val2017.zip 2>/dev/null || true
-mv val2017 coco-val2017 2>/dev/null || true
-rm -f val2017.zip 2>/dev/null || true" 2>&1 | tee -a "$LOG_FILE" || true
-        fi
-        COCO_IMG=$(docker exec -u pi rpic_master bash -c \
+        log "  BSDS500 unavailable — trying COCO fallback (--with-coco)..."
+        COCO_IMG=$($EXEC_PREFIX bash -c \
             "find '$DS_ROOT/coco-val2017' -name '*.jpg' 2>/dev/null | sort | head -1" \
             2>/dev/null || true)
         if [[ -n "$COCO_IMG" ]]; then
@@ -310,25 +338,33 @@ rm -f val2017.zip 2>/dev/null || true" 2>&1 | tee -a "$LOG_FILE" || true
         fi
     fi
 
-    [[ -z "$RES_IMG" ]] && die "No test image available. Use --fix to redownload datasets or --image to specify one."
+    [[ -z "$RES_IMG" ]] && die "No test image available. Use --fix, --image, or --with-coco."
 fi
 
 log "RESILIENCE_IMAGE: $RES_IMG"
 
 # ── Step 3: Build ─────────────────────────────────────────────────────────────
+# Auto-skip if a previous build succeeded and --fix was not given.
+if [[ $SKIP_BUILD -eq 0 && $FIX -eq 0 && -f "$BUILD_SENTINEL" ]]; then
+    log "  [AUTO] Skipping build — sentinel present ($BUILD_SENTINEL)."
+    log "         Delete the sentinel or pass --fix to force a rebuild."
+    SKIP_BUILD=1
+fi
+
 if [[ $SKIP_BUILD -eq 0 ]]; then
     section "STEP 3: Building resilience and bully election binaries"
     compile_binary "vision/resilience/resilience_test"  "$BUILD/resilience_test"
     compile_binary "vision/resilience/bully_election"   "$BUILD/bully_election"
-    # Also build a baseline for the reference checksum
-    compile_binary "vision/shared/baselines"        "$BUILD/baselines"
+    compile_binary "vision/shared/baselines"            "$BUILD/baselines"
     log "Binaries compiled"
+    touch "$BUILD_SENTINEL"
 else
-    log "Skipping build (--skip-build)"
+    section "STEP 3: Build (skipped)"
+    log "  Using existing binaries in workspace/$BUILD/"
 fi
 
-RES_CONT="/home/pi/workspace/results/resilience"
-docker exec -u pi rpic_master mkdir -p "$RES_CONT" 2>/dev/null || true
+RES_CONT="$CONT_WS/results/resilience"
+$EXEC_PREFIX mkdir -p "$RES_CONT" 2>/dev/null || true
 
 # ── Step 4: Serial baseline (for checksum reference) ─────────────────────────
 section "STEP 4: Serial baseline (checksum reference)"
@@ -340,25 +376,21 @@ section "STEP 5: Resilience Tests"
 log "  Nodes for resilience: $RESILIENCE_NODES"
 log "  Test image: $RES_IMG"
 
-# Test 2 (slow node) first — it is non-destructive and always terminates
 log ""
 log "  [Resilience] Test 2: Slow Node / Straggler Detection"
 runc "$RESILIENCE_NODES" "$BUILD/resilience_test" \
     "$RES_IMG $RES_CONT --test 2"
 
-# Test 1 — worker crash (may terminate early)
 log ""
 log "  [Resilience] Test 1: Worker Crash + Recovery"
 runc "$RESILIENCE_NODES" "$BUILD/resilience_test" \
     "$RES_IMG $RES_CONT --test 1" || true
 
-# Test 3 — coordinator crash + re-election
 log ""
 log "  [Resilience] Test 3: Coordinator Recovery"
 runc "$RESILIENCE_NODES" "$BUILD/resilience_test" \
     "$RES_IMG $RES_CONT --test 3" || true
 
-# Test 4 — partial result assembly
 log ""
 log "  [Resilience] Test 4: Partial Result Assembly"
 runc "$RESILIENCE_NODES" "$BUILD/resilience_test" \
@@ -383,7 +415,7 @@ fi
 
 log "BULLY_ELECTION_END"
 
-# ── Step 7: Quick mode — additional scenarios ─────────────────────────────────
+# ── Step 7: Extended tests (multi-node sweep) ─────────────────────────────────
 if [[ $QUICK -eq 0 ]]; then
     section "STEP 7: Extended Tests (multi-node sweep)"
     for n in 3 4; do
@@ -398,18 +430,18 @@ if [[ $QUICK -eq 0 ]]; then
     done
 fi
 
-# ── Step 8: Copy resilience output images ─────────────────────────────────────
-section "STEP 8: Collecting output images"
-if docker exec -u pi rpic_master test -d "$RES_CONT" 2>/dev/null; then
-    docker exec -u pi rpic_master bash -c \
-        "cd /home/pi/workspace/results && tar cf - resilience" \
+# ── Step 7: Copy reconstructed resilience images ──────────────────────────────
+section "STEP 7: Copying resilience results to $OUT_DIR"
+mkdir -p "$OUT_DIR/resilience_images"
+if $EXEC_PREFIX test -d "$RES_CONT" 2>/dev/null; then
+    $EXEC_PREFIX bash -c \
+        "cd $CONT_WS/results && tar cf - resilience" \
         | tar xf - -C "$WS/results/" 2>/dev/null || true
     cp -r "$WS/results/resilience/." "$OUT_DIR/resilience_images/" 2>/dev/null || true
     log "  Resilience images → $OUT_DIR/resilience_images/"
 else
     log "  [WARN] No resilience output directory found"
 fi
-mkdir -p "$OUT_DIR/resilience_images"
 
 # ── Step 9: Generate report ───────────────────────────────────────────────────
 section "STEP 9: Generating Resilience Report"

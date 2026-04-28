@@ -37,3 +37,9 @@ workspace/vision/datasets/
 
 # Generated images
 *.png
+
+# RPI cluster config — contains real IPs, never commit
+rpi/config.env
+
+# Dev folder for sample/testing/scratch files
+_dev/

@@ -1,3 +1,4 @@
+#include <mpi.h>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -5,146 +6,156 @@
 #include "fft_utils.h"
 #include <iostream>
 #include <vector>
-#include <sys/time.h>
-#include <omp.h>
 
 using namespace std;
 
-double get_time() {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec + tv.tv_usec * 1e-6;
-}
-
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        cout << "Usage: " << argv[0] << " <image_path> [num_threads]\n";
-        return 1;
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    const char* out_path = (argc > 2) ? argv[argc-1] : "fft_arch1_out.png";
+
+    int new_w = 0, new_h = 0, orig_w = 0, orig_h = 0;
+    vector<Complex> data;
+    double t_start;
+
+    if (rank == 0) {
+        if (argc < 2) { MPI_Abort(MPI_COMM_WORLD, 1); }
+        int channels;
+        unsigned char* img_data = stbi_load(argv[1], &orig_w, &orig_h, &channels, 0);
+        if (!img_data) { cerr << "Failed to load image\n"; MPI_Abort(MPI_COMM_WORLD, 1); }
+        new_w = next_power_of_2(orig_w);
+        new_h = next_power_of_2(orig_h);
+        data.resize(new_w * new_h, Complex(0, 0));
+        for (int y = 0; y < orig_h; ++y)
+            for (int x = 0; x < orig_w; ++x) {
+                double sign = ((x + y) % 2 == 0) ? 1.0 : -1.0;
+                data[y * new_w + x] = Complex(img_data[(y * orig_w + x) * channels] * sign, 0);
+            }
+        stbi_image_free(img_data);
+        t_start = MPI_Wtime();
     }
-    int num_threads = 4;
-    if (argc >= 3) num_threads = atoi(argv[2]);
-    omp_set_num_threads(num_threads);
 
-    string img_path = argv[1];
-    int width, height, channels;
-    unsigned char* img_data = stbi_load(img_path.c_str(), &width, &height, &channels, 0);
-    if (!img_data) { cerr << "Failed to load image\n"; return 1; }
+    MPI_Bcast(&new_w, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&new_h, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&orig_w, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&orig_h, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    int new_w = next_power_of_2(width);
-    int new_h = next_power_of_2(height);
-    vector<Complex> data(new_w * new_h, Complex(0,0));
+    int rows_per_proc = new_h / size;
+    int cols_per_proc = new_w / size;
 
-    for (int y = 0; y < height; ++y)
-        for (int x = 0; x < width; ++x) {
-            double sign = ((x + y) % 2 == 0) ? 1.0 : -1.0;
-            unsigned char pixel = img_data[(y * width + x) * channels];
-            data[y * new_w + x] = Complex(pixel * sign, 0);
-        }
-    stbi_image_free(img_data);
-
-    double t_start = get_time();
-    
-    // 1. Forward Row Pass — only over actual data rows (height), not zero-padded rows
-    #pragma omp parallel for schedule(dynamic)
-    for (int y = 0; y < new_h; ++y) {   // keep new_h so FFT sees full padded size
+    // ---- Step 1: Forward Row FFT ----
+    vector<Complex> local_rows(rows_per_proc * new_w);
+    MPI_Scatter(data.data(), rows_per_proc * new_w * 2, MPI_DOUBLE,
+                local_rows.data(), rows_per_proc * new_w * 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    for (int y = 0; y < rows_per_proc; ++y) {
         vector<Complex> row(new_w);
-        for (int x = 0; x < new_w; ++x) row[x] = data[y * new_w + x];
+        for (int x = 0; x < new_w; ++x) row[x] = local_rows[y * new_w + x];
         fft1d(row);
-        for (int x = 0; x < new_w; ++x) data[y * new_w + x] = row[x];
+        for (int x = 0; x < new_w; ++x) local_rows[y * new_w + x] = row[x];
     }
+    MPI_Gather(local_rows.data(), rows_per_proc * new_w * 2, MPI_DOUBLE,
+               data.data(), rows_per_proc * new_w * 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-    // 2. Forward Col Pass
-    #pragma omp parallel for schedule(dynamic)
-    for (int x = 0; x < new_w; ++x) {
+    // ---- Step 2: Forward Col FFT ----
+    // Transpose on rank 0 so cols become rows for scatter
+    if (rank == 0) {
+        vector<Complex> temp(new_w * new_h);
+        for (int y = 0; y < new_h; ++y)
+            for (int x = 0; x < new_w; ++x)
+                temp[x * new_h + y] = data[y * new_w + x];
+        data = temp;
+    }
+    vector<Complex> local_cols(cols_per_proc * new_h);
+    MPI_Scatter(data.data(), cols_per_proc * new_h * 2, MPI_DOUBLE,
+                local_cols.data(), cols_per_proc * new_h * 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    for (int x = 0; x < cols_per_proc; ++x) {
         vector<Complex> col(new_h);
-        for (int y = 0; y < new_h; ++y) col[y] = data[y * new_w + x];
+        for (int y = 0; y < new_h; ++y) col[y] = local_cols[x * new_h + y];
         fft1d(col);
-        for (int y = 0; y < new_h; ++y) data[y * new_w + x] = col[y];
+        for (int y = 0; y < new_h; ++y) local_cols[x * new_h + y] = col[y];
     }
+    MPI_Gather(local_cols.data(), cols_per_proc * new_h * 2, MPI_DOUBLE,
+               data.data(), cols_per_proc * new_h * 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-    vector<float> magnitude(new_w * new_h);
-    float max_mag = 0.0f;
-
-    for (int y = 0; y < new_h; ++y) {
-        for (int x = 0; x < new_w; ++x) {
-            Complex c = data[y * new_w + x];
-            float mag = sqrt(c.real() * c.real() + c.imag() * c.imag());
-            magnitude[y * new_w + x] = log(1.0f + mag);
-            if (magnitude[y * new_w + x] > max_mag)
-                max_mag = magnitude[y * new_w + x];
-        }
-    }
-
-    // 2. Normalize to 0-255 and save
-    vector<unsigned char> fft_vis(new_w * new_h);
-    for (int y = 0; y < new_h; ++y)
+    // ---- Step 3: Apply GHPF (rank 0, data is still transposed: shape new_w x new_h) ----
+    if (rank == 0) {
+        // Transpose back to row-major (new_h x new_w) before applying filter
+        vector<Complex> temp(new_w * new_h);
         for (int x = 0; x < new_w; ++x)
-            fft_vis[y * new_w + x] = (unsigned char)(255.0f * magnitude[y * new_w + x] / max_mag);
+            for (int y = 0; y < new_h; ++y)
+                temp[y * new_w + x] = data[x * new_h + y];
+        data = temp;
 
-    stbi_write_png("fft_magnitude.png", new_w, new_h, 1, fft_vis.data(), new_w);
+        int cx = new_w / 2, cy = new_h / 2;
+        double d0 = 10.0;
+        for (int y = 0; y < new_h; ++y)
+            for (int x = 0; x < new_w; ++x) {
+                double d2 = (double)(x - cx) * (x - cx) + (double)(y - cy) * (y - cy);
+                double h = 1.0 - exp(-d2 / (2.0 * d0 * d0));
+                data[y * new_w + x] *= h;
+            }
 
-    // 3. GHPF
-    int cx = new_w / 2, cy = new_h / 2;
-    double d0 = 10.0;
-    #pragma omp parallel for collapse(2)
-    for (int y = 0; y < new_h; ++y)
-        for (int x = 0; x < new_w; ++x) {
-            double d2 = (double)(x-cx)*(x-cx) + (double)(y-cy)*(y-cy);
-            double h = 1.0 - exp(-d2 / (2.0 * d0 * d0));
-            data[y * new_w + x] *= h;
-        }
+        // Transpose again for col scatter
+        vector<Complex> temp2(new_w * new_h);
+        for (int y = 0; y < new_h; ++y)
+            for (int x = 0; x < new_w; ++x)
+                temp2[x * new_h + y] = data[y * new_w + x];
+        data = temp2;
+    }
 
-    // 4. Inverse Col Pass
-    #pragma omp parallel for schedule(dynamic)
-    for (int x = 0; x < new_w; ++x) {
+    // ---- Step 4: Inverse Col IFFT ----
+    MPI_Scatter(data.data(), cols_per_proc * new_h * 2, MPI_DOUBLE,
+                local_cols.data(), cols_per_proc * new_h * 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    for (int x = 0; x < cols_per_proc; ++x) {
         vector<Complex> col(new_h);
-        for (int y = 0; y < new_h; ++y) col[y] = data[y * new_w + x];
+        for (int y = 0; y < new_h; ++y) col[y] = local_cols[x * new_h + y];
         ifft1d(col);
-        for (int y = 0; y < new_h; ++y) data[y * new_w + x] = col[y];
+        for (int y = 0; y < new_h; ++y) local_cols[x * new_h + y] = col[y];
     }
+    MPI_Gather(local_cols.data(), cols_per_proc * new_h * 2, MPI_DOUBLE,
+               data.data(), cols_per_proc * new_h * 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-    // 5. Inverse Row Pass
-    #pragma omp parallel for schedule(dynamic)
-    for (int y = 0; y < new_h; ++y) {
+    // ---- Step 5: Inverse Row IFFT ----
+    if (rank == 0) {
+        // Transpose back to row-major
+        vector<Complex> temp(new_w * new_h);
+        for (int x = 0; x < new_w; ++x)
+            for (int y = 0; y < new_h; ++y)
+                temp[y * new_w + x] = data[x * new_h + y];
+        data = temp;
+    }
+    MPI_Scatter(data.data(), rows_per_proc * new_w * 2, MPI_DOUBLE,
+                local_rows.data(), rows_per_proc * new_w * 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    for (int y = 0; y < rows_per_proc; ++y) {
         vector<Complex> row(new_w);
-        for (int x = 0; x < new_w; ++x) row[x] = data[y * new_w + x];
+        for (int x = 0; x < new_w; ++x) row[x] = local_rows[y * new_w + x];
         ifft1d(row);
-        for (int x = 0; x < new_w; ++x) data[y * new_w + x] = row[x];
+        for (int x = 0; x < new_w; ++x) local_rows[y * new_w + x] = row[x];
     }
+    MPI_Gather(local_rows.data(), rows_per_proc * new_w * 2, MPI_DOUBLE,
+               data.data(), rows_per_proc * new_w * 2, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-    // Find max edge magnitude
-    float max_edge = 0.0f;
-    for (int y = 0; y < new_h; ++y)
-        for (int x = 0; x < new_w; ++x) {
-            Complex c = data[y * new_w + x];
-            float mag = sqrt(c.real() * c.real() + c.imag() * c.imag());
+    // ---- Output ----
+    if (rank == 0) {
+        double t_end = MPI_Wtime();
+        cout << "FFT Arch3 (Dist Dynamic/Scatter-Gather) Time: " << (t_end - t_start) << " s.\n";
+
+        float max_edge = 0.0f;
+        for (int i = 0; i < new_w * new_h; ++i) {
+            float mag = sqrt(data[i].real() * data[i].real() + data[i].imag() * data[i].imag());
             if (mag > max_edge) max_edge = mag;
         }
-
-    // Normalize and save
-    vector<unsigned char> edge_output(new_w * new_h);
-    for (int y = 0; y < new_h; ++y)
-        for (int x = 0; x < new_w; ++x) {
-            Complex c = data[y * new_w + x];
-            float mag = sqrt(c.real() * c.real() + c.imag() * c.imag());
-            edge_output[y * new_w + x] = (unsigned char)(255.0f * mag / max_edge);
+        vector<unsigned char> out(new_w * new_h);
+        for (int i = 0; i < new_w * new_h; ++i) {
+            float mag = sqrt(data[i].real() * data[i].real() + data[i].imag() * data[i].imag());
+            out[i] = (unsigned char)(255.0f * mag / max_edge);
         }
+        stbi_write_png(out_path, new_w, new_h, 1, out.data(), new_w);
+    }
 
-    stbi_write_png("fft_arch1_out.png", new_w, new_h, 1, edge_output.data(), new_w);
-    printf("Saved edge output to fft_arch1_out.png\n");
-
-    double t_end = get_time();
-    cout << "FFT Arch1 (Farm) Time: " << (t_end - t_start) << " s using " << num_threads << " threads.\n";
-
-    // Save Result
-    // vector<unsigned char> out(width * height);
-    // for (int y = 0; y < height; ++y)
-    //     for (int x = 0; x < width; ++x) {
-    //         double sign = ((x + y) % 2 == 0) ? 1.0 : -1.0;
-    //         double val = data[y * new_w + x].real() * sign;
-    //         out[y * width + x] = (unsigned char)max(0.0, min(255.0, val + 128.0));
-    //     }
-
-    ///stbi_write_png("fft_arch1_out.png", width, height, 1, out.data(), width);
+    MPI_Finalize();
     return 0;
 }
