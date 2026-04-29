@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # =============================================================================
 #  run_analysis_bsds.sh — BSDS500 performance + image quality analysis
 #
@@ -9,19 +9,24 @@
 #  Usage:
 #    ./run_analysis_bsds.sh                        # defaults (10 images)
 #    ./run_analysis_bsds.sh --quick                # 3 images, fewer configs
+#    ./run_analysis_bsds.sh --native               # run on physical Pis (SSH)
 #    ./run_analysis_bsds.sh --fix                  # wipe + redownload BSDS500, then run
 #    ./run_analysis_bsds.sh --skip-build
 #    ./run_analysis_bsds.sh --nodes 2,4 --threads 1,4
 #    ./run_analysis_bsds.sh --n-images 50
 #    ./run_analysis_bsds.sh --timeout 180          # per-run timeout (seconds)
+#
+#  After completion, run the report generator manually:
+#    python3 analysis/generate_report_bsds.py \
+#        --log analysis/report_bsds/analysis_bsds.log \
+#        --outdir analysis/report_bsds \
+#        --recon-dir analysis/report_bsds/reconstructed \
+#        --node-counts "2 4 6" --thread-counts "1 2 4"
 # =============================================================================
 
 set -uo pipefail
 
-# ── Paths (defined first so BUILD_SENTINEL can reference SCRIPT_DIR) ──────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Sentinel file written after a successful build so --skip-build is automatic
 BUILD_SENTINEL="$SCRIPT_DIR/.build_ok_bsds"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
@@ -35,13 +40,11 @@ NATIVE=0
 BSDS_N=10
 TIMEOUT_SECS=180
 
-# Container workspace root (fixed by docker-compose bind-mount)
 CONT_WS="/home/pi/workspace"
 DS_ROOT="$CONT_WS/vision/datasets"
 
-# Resolved dynamically in Step 2
 BSDS_DIR=""
-BSDS_GT_DIR=
+BSDS_GT_DIR=""
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -59,6 +62,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+[[ $FIX -eq 1 ]] && rm -f "$BUILD_SENTINEL"
+
 if [[ $QUICK -eq 1 ]]; then
     NODE_COUNTS=(2 4)
     THREAD_COUNTS=(1 2)
@@ -70,10 +75,7 @@ OUT_DIR="$SCRIPT_DIR/report_bsds"
 LOG_FILE="$OUT_DIR/analysis_bsds.log"
 WS="$SCRIPT_DIR/../workspace"
 BUILD="build"
-DS_ROOT="$CONT_WS/vision/datasets"
-[[ $NATIVE -eq 1 ]] && DS_ROOT="$WS/vision/datasets"
 
-# EXEC_PREFIX: Docker mode = docker exec; Native mode = ssh to master Pi
 EXEC_PREFIX="docker exec -u pi rpic_master"
 if [[ $NATIVE -eq 1 ]]; then
     RPI_CONFIG="$SCRIPT_DIR/../rpi/config.env"
@@ -83,8 +85,10 @@ if [[ $NATIVE -eq 1 ]]; then
             || { echo "[FATAL] gen_config.sh failed"; exit 1; }
     fi
     source "$RPI_CONFIG"
-    NATIVE_WS=$(ssh "${MASTER_USER}@${MASTER_IP}" "echo ${RPI_WORKSPACE_DIR}" 2>/dev/null) \
+    _q_ws=$(printf '%q' "${RPI_WORKSPACE_DIR}")
+    NATIVE_WS=$(ssh "${MASTER_USER}@${MASTER_IP}" "bash -lc \"echo ${_q_ws}\"" 2>/dev/null) \
         || { echo "[FATAL] Cannot SSH to ${MASTER_USER}@${MASTER_IP}"; exit 1; }
+    unset _q_ws
     CONT_WS="$NATIVE_WS"
     DS_ROOT="$NATIVE_WS/vision/datasets"
     EXEC_PREFIX="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new ${MASTER_USER}@${MASTER_IP}"
@@ -92,25 +96,22 @@ fi
 
 mkdir -p "$OUT_DIR"
 
-# ── Verify shortcut: just regenerate report from existing log ─────────────────
+# ── Verify shortcut ───────────────────────────────────────────────────────────
 if [[ $VERIFY -eq 1 ]]; then
     if [[ ! -f "$LOG_FILE" ]]; then
         echo "[VERIFY] No log found at $LOG_FILE — run without --verify first"
         exit 1
     fi
-    echo "[VERIFY] Re-running BSDS report generator from: $LOG_FILE"
-    ORIG_ARG=""
+    echo "[VERIFY] Log is at: $LOG_FILE"
+    ORIG_ARG=""; GT_ARG=""
     [[ -d "$OUT_DIR/originals" ]] && ORIG_ARG="--orig-dir $OUT_DIR/originals"
-    GT_ARG=""
-    [[ -d "$OUT_DIR/gt" ]] && GT_ARG="--gt-dir $OUT_DIR/gt"
-    python3 "$SCRIPT_DIR/generate_report_bsds.py" \
-        --log           "$LOG_FILE" \
-        --outdir        "$OUT_DIR" \
-        --recon-dir     "$OUT_DIR/reconstructed" \
-        --node-counts   "${NODE_COUNTS[*]}" \
-        --thread-counts "${THREAD_COUNTS[*]}" \
-        $ORIG_ARG $GT_ARG
-    exit $?
+    [[ -d "$OUT_DIR/gt" ]]        && GT_ARG="--gt-dir $OUT_DIR/gt"
+    echo "  Run manually: python3 $SCRIPT_DIR/generate_report_bsds.py \\"
+    echo "      --log $LOG_FILE --outdir $OUT_DIR \\"
+    echo "      --recon-dir $OUT_DIR/reconstructed \\"
+    echo "      --node-counts \"${NODE_COUNTS[*]}\" --thread-counts \"${THREAD_COUNTS[*]}\" \\"
+    echo "      ${ORIG_ARG} ${GT_ARG}"
+    exit 0
 fi
 
 : > "$LOG_FILE"
@@ -126,30 +127,43 @@ log "Nodes   : ${NODE_COUNTS[*]}"
 log "Threads : ${THREAD_COUNTS[*]}"
 log "N images: $BSDS_N"
 log "Timeout : ${TIMEOUT_SECS}s per run"
+log "Mode    : $([ $NATIVE -eq 1 ] && echo 'Native RPi (SSH)' || echo 'Docker containers (local)')"
+if [[ $NATIVE -eq 1 ]]; then
+    log "Hosts   : SSH ${MASTER_USER}@${MASTER_IP} (mpirun --host uses IPs)"
+else
+    log "Hosts   : Docker containers rpic_master/rpic_worker* (mpirun --host uses master/workerN)"
+fi
 log "Out dir : $OUT_DIR"
+
+MAX_NODES="${NODE_COUNTS[-1]}"
 
 # ── Step 0: Docker + RAM check ────────────────────────────────────────────────
 if [[ $NATIVE -eq 0 ]]; then
     section "STEP 0: Checking Docker and available RAM"
     command -v docker &>/dev/null || die "Docker not found on PATH"
     docker compose version &>/dev/null || docker-compose --version &>/dev/null || die "Docker Compose not found"
+    log "Docker OK"
+else
+    section "STEP 0: Native mode (SSH)"
+    log "Docker checks skipped"
+fi
 command -v timeout &>/dev/null || { log "[WARN] 'timeout' not found — runs will not be time-limited"; TIMEOUT_SECS=0; }
-log "Docker OK"
 
-# Warn if free RAM is too low for the requested node count.
-# Each container has mem_limit: 1g so we need at least (MAX_NODES + 1) GB free.
-MAX_NODES="${NODE_COUNTS[-1]}"
-if command -v free &>/dev/null; then
-    FREE_MB=$(free -m | awk '/^Mem:/{print $7}')
-    NEEDED_MB=$(( (MAX_NODES + 1) * 1024 ))
-    log "RAM check: ${FREE_MB}MB free, ${NEEDED_MB}MB needed for ${MAX_NODES} nodes"
-    if [[ $FREE_MB -lt $NEEDED_MB ]]; then
-        log "[WARN] Low available RAM (${FREE_MB}MB < ${NEEDED_MB}MB)."
-        log "       Consider --nodes $(( MAX_NODES / 2 )) or closing other applications."
-        log "       Continuing anyway — expect swap-induced slowdowns."
+if [[ $NATIVE -eq 0 ]]; then
+    if command -v free &>/dev/null; then
+        FREE_MB=$(free -m | awk '/^Mem:/{print $7}')
+        NEEDED_MB=$(( (MAX_NODES + 1) * 1024 ))
+        log "RAM check: ${FREE_MB}MB free, ${NEEDED_MB}MB needed for ${MAX_NODES} nodes"
+        if [[ $FREE_MB -lt $NEEDED_MB ]]; then
+            log "[WARN] Low available RAM (${FREE_MB}MB < ${NEEDED_MB}MB)."
+            log "       Consider --nodes $(( MAX_NODES / 2 )) or closing other applications."
+            log "       Continuing anyway — expect swap-induced slowdowns."
+        fi
+    else
+        log "[WARN] 'free' not found — skipping RAM check"
     fi
 else
-    log "[WARN] 'free' not found — skipping RAM check"
+    log "RAM check: skipped (native mode)"
 fi
 
 # ── Cluster helpers ───────────────────────────────────────────────────────────
@@ -158,11 +172,7 @@ master_running() {
     status=$(docker inspect --format '{{.State.Status}}' rpic_master 2>/dev/null)
     [[ "$status" == "running" ]]
 }
-
-master_healthy() {
-    $EXEC_PREFIX echo "ok" &>/dev/null
-}
-
+master_healthy() { $EXEC_PREFIX echo "ok" &>/dev/null; }
 images_exist()   { docker image inspect pdc_project-master &>/dev/null; }
 
 ensure_cluster() {
@@ -203,13 +213,12 @@ ensure_cluster() {
     log "  Cluster ready ($n nodes)"
 }
 
-# ── Ensure datasets exist (laptop or Pi) ──────────────────────────────────────
+# ── ensure_datasets ───────────────────────────────────────────────────────────
 ensure_datasets() {
     local LOCAL_DS="$WS/vision/datasets"
     local -a needed=("$@")
 
     if [[ $NATIVE -eq 1 ]]; then
-        # Native mode: check Pi, rsync from laptop if missing
         local REMOTE_DS="$NATIVE_WS/vision/datasets"
         $EXEC_PREFIX mkdir -p "$REMOTE_DS" 2>/dev/null || true
         for ds in "${needed[@]}"; do
@@ -230,7 +239,6 @@ ensure_datasets() {
             fi
         done
     else
-        # Docker mode: run centralized downloader inside container
         local DL_FLAGS=""
         [[ $FIX -eq 1 ]] && DL_FLAGS="--fix"
         local needed_flags=""
@@ -244,45 +252,96 @@ ensure_datasets() {
     fi
 }
 
-# ── ensure_build_on_pi: deploy source + compile if binaries missing ───────────
+required_binaries_ok() {
+    local verbose="${1:-0}"
+    local -a rel_bins=(
+        "$BUILD/baselines"
+        "$BUILD/sobel_arch1" "$BUILD/sobel_arch2" "$BUILD/sobel_arch3" "$BUILD/sobel_arch4"
+        "$BUILD/canny_arch1" "$BUILD/canny_arch2" "$BUILD/canny_arch3" "$BUILD/canny_arch4"
+        "$BUILD/log_arch1"   "$BUILD/log_arch2"   "$BUILD/log_arch3"   "$BUILD/log_arch4"
+        "$BUILD/fft_arch1"   "$BUILD/fft_arch2"   "$BUILD/fft_arch3"   "$BUILD/fft_arch4"
+    )
+    local ok=1
+    for rel in "${rel_bins[@]}"; do
+        local abs
+        if [[ $NATIVE -eq 1 ]]; then
+            abs="${RPI_SHARED_BIN}/$(basename "${rel}")"
+        else
+            abs="$CONT_WS/$rel"
+        fi
+        if ! $EXEC_PREFIX test -s "$abs" 2>/dev/null || ! $EXEC_PREFIX test -x "$abs" 2>/dev/null; then
+            [[ "$verbose" -eq 1 ]] && log "  [WARN] Missing or non-executable binary: $abs"
+            ok=0
+        fi
+    done
+    [[ $ok -eq 1 ]]
+}
+
 ensure_build_on_pi() {
-    if [[ $FIX -eq 1 ]] || ! $EXEC_PREFIX test -f "$NATIVE_WS/build/sobel_arch1" 2>/dev/null; then
-        log "  Binaries missing on Pi (or --fix) — running deploy..."
+    if [[ $FIX -eq 1 ]]; then
+        log "  --fix set — running deploy..."
         bash "$SCRIPT_DIR/../rpi/deploy.sh" 2>&1 | tee -a "$LOG_FILE"
-        log "  ✓ Deploy complete"
-    else
+        if required_binaries_ok 0; then
+            log "  ✓ Deploy complete"
+            SKIP_BUILD=1
+        else
+            log "  [WARN] Deploy finished but required binaries are still missing."
+            required_binaries_ok 1 || true
+        fi
+        return 0
+    fi
+
+    if required_binaries_ok 0; then
         log "  Binaries already on Pi ✓"
         SKIP_BUILD=1
+        return 0
+    fi
+
+    log "  Binaries missing on Pi — running deploy..."
+    bash "$SCRIPT_DIR/../rpi/deploy.sh" 2>&1 | tee -a "$LOG_FILE"
+    if required_binaries_ok 0; then
+        log "  ✓ Deploy complete"
+        SKIP_BUILD=1
+    else
+        log "  [WARN] Deploy finished but required binaries are still missing."
+        required_binaries_ok 1 || true
     fi
 }
 
-# ── Step 1: Start cluster / Prepare Pi ───────────────────────────────────────
-if [[ $NATIVE -eq 0 ]]; then
-    section "STEP 1: Starting cluster (${MAX_NODES} nodes)"
-    cd "$SCRIPT_DIR"
-    ensure_cluster
-    log "Verifying MPI connectivity..."
-    $EXEC_PREFIX mpirun --allow-run-as-root -n "$MAX_NODES" \
-        --host "$(hostlist_for "$MAX_NODES")" hostname \
-        2>&1 | tee -a "$LOG_FILE" \
-        && log "Cluster verification: OK" \
-        || log "[WARN] Cluster verification failed — continuing anyway"
-else
-    section "STEP 1: Preparing RPi cluster (${MAX_NODES} nodes, SSH)"
-    ensure_build_on_pi
-fi
+# ── hostlist_for ──────────────────────────────────────────────────────────────
+hostlist_for() {
+    local n="$1"
+    if [[ $NATIVE -eq 1 ]]; then
+        local ALL_IPS=("$MASTER_IP" "$WORKER1_IP" "$WORKER2_IP" "$WORKER3_IP" "$WORKER4_IP" "$WORKER5_IP")
+        local hosts=()
+        for ((i=0; i<n; i++)); do hosts+=("${ALL_IPS[$i]}"); done
+        local IFS=','; echo "${hosts[*]}"
+    else
+        local hosts=(master)
+        for ((i=1; i<n; i++)); do hosts+=("worker$i"); done
+        local IFS=','; echo "${hosts[*]}"
+    fi
+}
 
-# ── Run helper with timeout guard ─────────────────────────────────────────────
+# ── runc: run an MPI command with optional timeout ────────────────────────────
 runc() {
     local nodes="$1" bin="$2"; shift 2
     local args="${*:-}"
     local hostlist
     hostlist="$(hostlist_for "$nodes")"
+
+    local bin_path
+    if [[ $NATIVE -eq 1 ]]; then
+        bin_path="${RPI_SHARED_BIN}/$(basename "${bin}")"
+    else
+        bin_path="${CONT_WS}/${bin}"
+    fi
+
     log "  [RUN] $bin  nodes=$nodes  args=$args"
 
-    local cmd="cd $CONT_WS && \
+    local cmd="cd ${CONT_WS} && \
         mpirun --allow-run-as-root -n ${nodes} --host ${hostlist} \
-        ${CONT_WS}/${bin} ${args}"
+        ${bin_path} ${args}"
 
     if [[ "${TIMEOUT_SECS:-0}" -gt 0 ]]; then
         timeout "$TIMEOUT_SECS" \
@@ -305,17 +364,33 @@ compile_binary() {
     local src_stem="$1" out_name="$2"
     log "  [COMPILE] $src_stem → $out_name"
     $EXEC_PREFIX bash -c \
-        "cd $CONT_WS && \
-         mkdir -p \$(dirname $out_name) && \
+        "cd ${CONT_WS} && \
+         mkdir -p \$(dirname ${out_name}) && \
          mpic++ -std=c++17 -O2 -fopenmp -I./vision/shared ${src_stem}.cpp -o ${out_name} -lm" \
         2>&1 | tee -a "$LOG_FILE" \
     || log "  [WARN] Compile failed for $src_stem"
 }
 
+# ── Step 1: Start cluster / Prepare Pi ───────────────────────────────────────
+if [[ $NATIVE -eq 0 ]]; then
+    section "STEP 1: Starting cluster (${MAX_NODES} nodes)"
+    cd "$SCRIPT_DIR"
+    ensure_cluster
+    log "Verifying MPI connectivity..."
+    $EXEC_PREFIX mpirun --allow-run-as-root -n "$MAX_NODES" \
+        --host "$(hostlist_for "$MAX_NODES")" hostname \
+        2>&1 | tee -a "$LOG_FILE" \
+        && log "Cluster verification: OK" \
+        || log "[WARN] Cluster verification failed — continuing anyway"
+else
+    section "STEP 1: Preparing RPi cluster (${MAX_NODES} nodes, SSH)"
+    ensure_build_on_pi
+fi
+
 # ── Step 2: BSDS500 dataset ───────────────────────────────────────────────────
 section "STEP 2: BSDS500 Dataset Management (--fix=$FIX)"
 
-ensure_datasets "BSDS500"
+ensure_datasets "BSDS500" || die "Dataset provisioning failed"
 
 BSDS_DIR="$DS_ROOT/BSDS500/images"
 BSDS_GT_DIR="$DS_ROOT/BSDS500/groundTruth_png"
@@ -325,11 +400,21 @@ BSDS_LIST_HOST="$WS/results/bsds_img_list.txt"
 BSDS_LIST_CONT="$CONT_WS/results/bsds_img_list.txt"
 
 $EXEC_PREFIX bash -c \
-    "find '$BSDS_DIR' -name '*.jpg' | sort | head -${BSDS_N}" \
+    "find '${BSDS_DIR}' -type f -name '*.jpg' -size +0c 2>/dev/null | sort | head -${BSDS_N}" \
     > "$BSDS_LIST_HOST"
 ACTUAL_N=$(wc -l < "$BSDS_LIST_HOST")
 [[ $ACTUAL_N -eq 0 ]] && die "BSDS image list is empty"
 log "  Image list: $ACTUAL_N images -> $BSDS_LIST_HOST"
+
+# In native mode the list lives on the laptop; push it to the master Pi
+# so the arch4 batch binary can read it at BSDS_LIST_CONT.
+if [[ $NATIVE -eq 1 ]]; then
+    ssh "${MASTER_USER}@${MASTER_IP}" "mkdir -p $(dirname "${BSDS_LIST_CONT}")"
+    scp "$BSDS_LIST_HOST" "${MASTER_USER}@${MASTER_IP}:${BSDS_LIST_CONT}" \
+        2>&1 | tee -a "$LOG_FILE" \
+        && log "  ✓ Image list pushed to Pi: $BSDS_LIST_CONT" \
+        || log "  [WARN] Failed to push image list to Pi"
+fi
 
 GT_AVAILABLE=0
 if $EXEC_PREFIX test -d "$BSDS_GT_DIR" 2>/dev/null; then
@@ -344,18 +429,18 @@ for sub in sobel_arch1 sobel_arch2 sobel_arch3 sobel_arch4 \
            canny_arch1 canny_arch2 canny_arch3 canny_arch4 \
            log_arch1  log_arch2  log_arch3  log_arch4  \
            fft_arch1  fft_arch2  fft_arch3  fft_arch4; do
-    $EXEC_PREFIX mkdir -p "$BSDS_OUT_CONT/$sub" 2>/dev/null || true
+    $EXEC_PREFIX mkdir -p "${BSDS_OUT_CONT}/$sub" 2>/dev/null || true
 done
 
 # ── Step 3: Build ─────────────────────────────────────────────────────────────
-# Auto-skip if a previous build succeeded and --fix was not given.
-# Shares the sentinel with run_analysis.sh via the same directory.
-# Use a separate sentinel name so the two scripts track independently.
-
 if [[ $SKIP_BUILD -eq 0 && $FIX -eq 0 && -f "$BUILD_SENTINEL" ]]; then
-    log "  [AUTO] Skipping build — sentinel present ($BUILD_SENTINEL)."
-    log "         Delete the sentinel or pass --fix to force a rebuild."
-    SKIP_BUILD=1
+    if required_binaries_ok 0; then
+        log "  [AUTO] Skipping build — sentinel present ($BUILD_SENTINEL)."
+        SKIP_BUILD=1
+    else
+        log "  [WARN] Build sentinel present but required binaries are missing — rebuilding."
+        rm -f "$BUILD_SENTINEL"
+    fi
 fi
 
 if [[ $SKIP_BUILD -eq 0 ]]; then
@@ -369,16 +454,22 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
     compile_binary "vision/canny/canny_arch2_pipeline"    "$BUILD/canny_arch2"
     compile_binary "vision/canny/canny_arch3_scatter"     "$BUILD/canny_arch3"
     compile_binary "vision/canny/canny_arch4_pipeline"    "$BUILD/canny_arch4"
-    compile_binary "vision/log/log_arch1_farm"          "$BUILD/log_arch1"
-    compile_binary "vision/log/log_arch2_pipeline"      "$BUILD/log_arch2"
-    compile_binary "vision/log/log_arch3_scatter"       "$BUILD/log_arch3"
-    compile_binary "vision/log/log_arch4_pipeline"      "$BUILD/log_arch4"
-    compile_binary "vision/fft/fft_arch1_farm"          "$BUILD/fft_arch1"
-    compile_binary "vision/fft/fft_arch2_pipeline"      "$BUILD/fft_arch2"
-    compile_binary "vision/fft/fft_arch3_dist_dynamic"  "$BUILD/fft_arch3"
-    compile_binary "vision/fft/fft_arch4_dist_pipeline" "$BUILD/fft_arch4"
+    compile_binary "vision/log/log_arch1_farm"            "$BUILD/log_arch1"
+    compile_binary "vision/log/log_arch2_pipeline"        "$BUILD/log_arch2"
+    compile_binary "vision/log/log_arch3_scatter"         "$BUILD/log_arch3"
+    compile_binary "vision/log/log_arch4_pipeline"        "$BUILD/log_arch4"
+    compile_binary "vision/fft/fft_arch1_farm"            "$BUILD/fft_arch1"
+    compile_binary "vision/fft/fft_arch2_pipeline"        "$BUILD/fft_arch2"
+    compile_binary "vision/fft/fft_arch3_dist_dynamic"    "$BUILD/fft_arch3"
+    compile_binary "vision/fft/fft_arch4_dist_pipeline"   "$BUILD/fft_arch4"
     log "All binaries compiled into workspace/$BUILD/"
-    touch "$BUILD_SENTINEL"
+    if required_binaries_ok 0; then
+        touch "$BUILD_SENTINEL"
+    else
+        log "  [WARN] Not writing build sentinel — one or more binaries are missing."
+        required_binaries_ok 1 || true
+        rm -f "$BUILD_SENTINEL"
+    fi
 else
     section "STEP 3: Build (skipped)"
     log "  Using existing binaries in workspace/$BUILD/"
@@ -400,29 +491,25 @@ run_filter_bsds() {
         local stem
         stem=$(basename "$img" | sed 's/\.[^.]*$//')
 
-        # Arch1: OMP Farm
         for t in "${THREAD_COUNTS[@]}"; do
-            runc 1 "$b1" "$img $t $BSDS_OUT_CONT/${tag}_arch1/${tag}_arch1_t${t}_${stem}.png"
+            runc 1 "$b1" "$img $t ${BSDS_OUT_CONT}/${tag}_arch1/${tag}_arch1_t${t}_${stem}.png"
         done
 
-        # Arch2: OMP Pipeline
-        runc 1 "$b2" "$img 32 $BSDS_OUT_CONT/${tag}_arch2/${tag}_arch2_${stem}.png"
+        runc 1 "$b2" "$img 32 ${BSDS_OUT_CONT}/${tag}_arch2/${tag}_arch2_${stem}.png"
 
-        # Arch3: MPI Scatter
         for n in "${NODE_COUNTS[@]}"; do
-            runc "$n" "$b3" "$img $BSDS_OUT_CONT/${tag}_arch3/${tag}_arch3_n${n}_${stem}.png"
+            runc "$n" "$b3" "$img ${BSDS_OUT_CONT}/${tag}_arch3/${tag}_arch3_n${n}_${stem}.png"
         done
 
-        # Arch4: MPI Pipeline single-image
         for n in "${NODE_COUNTS[@]}"; do
-            runc "$n" "$b4" "$img $BSDS_OUT_CONT/${tag}_arch4/${tag}_arch4_n${n}_${stem}.png"
+            runc "$n" "$b4" "$img ${BSDS_OUT_CONT}/${tag}_arch4/${tag}_arch4_n${n}_${stem}.png"
         done
     done < "$BSDS_LIST_HOST"
 
-    # Arch4 batch throughput (uses image list)
+    # Arch4 batch throughput (uses image list on Pi)
     log "IMAGE: BSDS_BATCH_${tag^^}"
     runc "${NODE_COUNTS[0]}" "$b4" \
-        "$BSDS_LIST_CONT $BSDS_OUT_CONT/${tag}_arch4 $ACTUAL_N"
+        "${BSDS_LIST_CONT} ${BSDS_OUT_CONT}/${tag}_arch4 ${ACTUAL_N}"
 }
 
 section "STEP 5: Sobel — All Architectures (BSDS500)"
@@ -434,16 +521,16 @@ while IFS= read -r img; do
     log "IMAGE: $img"
     stem=$(basename "$img" | sed 's/\.[^.]*$//')
     for t in "${THREAD_COUNTS[@]}"; do
-        runc 1 "$BUILD/canny_arch1" "$img $t $BSDS_OUT_CONT/canny_arch1/canny_arch1_t${t}_${stem}.png"
+        runc 1 "$BUILD/canny_arch1" "$img $t ${BSDS_OUT_CONT}/canny_arch1/canny_arch1_t${t}_${stem}.png"
     done
-    runc 1 "$BUILD/canny_arch2" "$img 32 $BSDS_OUT_CONT/canny_arch2/canny_arch2_${stem}.png"
+    runc 1 "$BUILD/canny_arch2" "$img 32 ${BSDS_OUT_CONT}/canny_arch2/canny_arch2_${stem}.png"
     for n in "${NODE_COUNTS[@]}"; do
-        runc "$n" "$BUILD/canny_arch3" "$img $BSDS_OUT_CONT/canny_arch3/canny_arch3_n${n}_${stem}.png"
+        runc "$n" "$BUILD/canny_arch3" "$img ${BSDS_OUT_CONT}/canny_arch3/canny_arch3_n${n}_${stem}.png"
     done
 done < "$BSDS_LIST_HOST"
 log "IMAGE: BSDS_BATCH_CANNY"
-$EXEC_PREFIX mkdir -p "$BSDS_OUT_CONT/canny_arch4" 2>/dev/null || true
-runc 4 "$BUILD/canny_arch4" "$BSDS_LIST_CONT $BSDS_OUT_CONT/canny_arch4 $ACTUAL_N"
+$EXEC_PREFIX mkdir -p "${BSDS_OUT_CONT}/canny_arch4" 2>/dev/null || true
+runc 4 "$BUILD/canny_arch4" "${BSDS_LIST_CONT} ${BSDS_OUT_CONT}/canny_arch4 ${ACTUAL_N}"
 
 section "STEP 7: LoG — All Architectures (BSDS500)"
 run_filter_bsds log "$BUILD/log_arch1" "$BUILD/log_arch2" \
@@ -462,12 +549,12 @@ while IFS= read -r img; do
     done
 done < "$BSDS_LIST_HOST"
 
-# ── Step 9: Copy reconstructed images ─────────────────────────────────────────
+# ── Step 9: Copy reconstructed images ────────────────────────────────────────
 section "STEP 9: Copying reconstructed images to $OUT_DIR"
 mkdir -p "$OUT_DIR/reconstructed"
 if $EXEC_PREFIX test -d "$BSDS_OUT_CONT" 2>/dev/null; then
     $EXEC_PREFIX bash -c \
-        "cd $CONT_WS/results && tar cf - bsds_out" \
+        "cd ${CONT_WS}/results && tar cf - bsds_out" \
         | tar xf - -C "$WS/results/" 2>/dev/null || true
     cp -r "$WS/results/bsds_out/." "$OUT_DIR/reconstructed/" 2>/dev/null || true
     log "  Reconstructed images → $OUT_DIR/reconstructed/"
@@ -476,48 +563,41 @@ else
 fi
 
 mkdir -p "$OUT_DIR/originals"
-if [[ -n "$BSDS_LIST_HOST" && -f "$BSDS_LIST_HOST" ]]; then
+if [[ -f "$BSDS_LIST_HOST" ]]; then
     while IFS= read -r orig_img; do
-        cp_dest="$OUT_DIR/originals/$(basename "$orig_img")"
         $EXEC_PREFIX bash -c \
-            "cat '$orig_img'" > "$cp_dest" 2>/dev/null || true
+            "cat '${orig_img}'" > "$OUT_DIR/originals/$(basename "$orig_img")" 2>/dev/null || true
     done < "$BSDS_LIST_HOST"
-    orig_count=$(find "$OUT_DIR/originals" -name "*.jpg" -o -name "*.png" 2>/dev/null | wc -l)
+    orig_count=$(find "$OUT_DIR/originals" \( -name "*.jpg" -o -name "*.png" \) 2>/dev/null | wc -l)
     log "  Original images → $OUT_DIR/originals/ ($orig_count files)"
 else
     log "  [WARN] bsds_img_list.txt not found — originals not copied"
 fi
 
-# ── Step 10: Generate report ──────────────────────────────────────────────────
-section "STEP 10: Generating BSDS500 Report"
-GT_ARG=""
+# ── Step 10: Copy ground-truth PNGs ──────────────────────────────────────────
 if [[ $GT_AVAILABLE -eq 1 ]]; then
+    mkdir -p "$WS/results/gt"
     $EXEC_PREFIX bash -c \
-        "cd '$DS_ROOT/BSDS500' && tar cf - groundTruth_png" \
+        "cd '${DS_ROOT}/BSDS500' && tar cf - groundTruth_png" \
         | tar xf - -C "$WS/results/gt/" 2>/dev/null || true
-    GT_ARG="--gt-dir $WS/results/gt/groundTruth_png"
-fi
-
-if command -v python3 &>/dev/null; then
-    ORIG_ARG=""
-    if [[ -d "$OUT_DIR/originals" ]]; then
-        orig_count=$(find "$OUT_DIR/originals" -maxdepth 1 \
-            \( -name "*.jpg" -o -name "*.png" \) 2>/dev/null | wc -l)
-        [[ $orig_count -gt 0 ]] && ORIG_ARG="--orig-dir $OUT_DIR/originals"
-    fi
-    python3 "$SCRIPT_DIR/generate_report_bsds.py" \
-        --log         "$LOG_FILE" \
-        --outdir      "$OUT_DIR" \
-        --recon-dir   "$OUT_DIR/reconstructed" \
-        --node-counts "${NODE_COUNTS[*]}" \
-        --thread-counts "${THREAD_COUNTS[*]}" \
-        $GT_ARG $ORIG_ARG \
-        2>&1 | tee -a "$LOG_FILE"
-else
-    log "[WARN] python3 not found — run generate_report_bsds.py manually"
+    log "  Ground-truth PNGs → $WS/results/gt/groundTruth_png/"
 fi
 
 section "ANALYSIS COMPLETE"
 log "Log file : $LOG_FILE"
 log "Report   : $OUT_DIR/"
 log "Finished : $(date)"
+log ""
+log "  To generate report run:"
+log "    python3 $SCRIPT_DIR/generate_report_bsds.py \\"
+log "        --log $LOG_FILE \\"
+log "        --outdir $OUT_DIR \\"
+log "        --recon-dir $OUT_DIR/reconstructed \\"
+log "        --node-counts \"${NODE_COUNTS[*]}\" \\"
+log "        --thread-counts \"${THREAD_COUNTS[*]}\""
+if [[ $GT_AVAILABLE -eq 1 ]]; then
+    log "        --gt-dir $WS/results/gt/groundTruth_png \\"
+fi
+if [[ -d "$OUT_DIR/originals" ]]; then
+    log "        --orig-dir $OUT_DIR/originals"
+fi

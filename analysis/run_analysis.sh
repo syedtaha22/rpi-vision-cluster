@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # =============================================================================
 #  run_analysis.sh — Multi-image-size performance analysis (CIFAR / Tiny / COCO)
 #
@@ -10,12 +10,16 @@
 #  Usage:
 #    ./run_analysis.sh                          # full run, defaults
 #    ./run_analysis.sh --quick                  # 1 image, fewer configs
+#    ./run_analysis.sh --native                 # run on physical Pis (SSH)
 #    ./run_analysis.sh --fix                    # wipe + redownload datasets, then run
 #    ./run_analysis.sh --skip-build             # skip recompiling binaries
 #    ./run_analysis.sh --nodes 2,4 --threads 1,4
 #    ./run_analysis.sh --image /path/to/img.png # skip dataset check, use this image
 #    ./run_analysis.sh --timeout 90             # per-run timeout (seconds)
-#    ./run_analysis.sh --with-coco              # include COCO-Val2017 (large, slow)
+#
+#  After completion, run the report generator manually:
+#    python3 analysis/generate_report.py --log analysis/analysis_results.log \
+#        --outdir analysis/report --node-counts "2 4 6" --thread-counts "1 2 4"
 # =============================================================================
 
 set -uo pipefail
@@ -28,19 +32,11 @@ QUICK=0
 FIX=0
 VERIFY=0
 NATIVE=0
-WITH_COCO=0           # opt-in: --with-coco
 CUSTOM_IMAGE=""
 TIMEOUT_SECS=120
 
-# Default per-dataset images (inside the container)
-CIFAR_IMG="/home/pi/workspace/vision/datasets/cifar-10/tabby_s_000074.png"
-TINY_IMG="/home/pi/workspace/vision/datasets/tiny-imagenet-200/test/images/test_0.JPEG"
-COCO_IMG="/home/pi/workspace/vision/datasets/coco-val2017/000000144003.jpg"
-
 # ── Parse arguments ───────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Sentinel file written after a successful build so --skip-build is automatic
 BUILD_SENTINEL="$SCRIPT_DIR/.build_ok"
 
 while [[ $# -gt 0 ]]; do
@@ -53,11 +49,12 @@ while [[ $# -gt 0 ]]; do
         --verify)     VERIFY=1;                                shift   ;;
         --native)     NATIVE=1;                                shift   ;;
         --fix)        FIX=1;                                   shift   ;;
-        --with-coco)  WITH_COCO=1;                             shift   ;;
         --timeout)    TIMEOUT_SECS="$2";                       shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+[[ $FIX -eq 1 ]] && rm -f "$BUILD_SENTINEL"
 
 if [[ $QUICK -eq 1 ]]; then
     NODE_COUNTS=(2 4)
@@ -69,29 +66,26 @@ IMAGES=()
 # ── Paths ─────────────────────────────────────────────────────────────────────
 LOG_FILE="$SCRIPT_DIR/analysis_results.log"
 REPORT_DIR="$SCRIPT_DIR/report"
-CONT_WS="/home/pi/workspace"       # path inside Docker container
-WS="$SCRIPT_DIR/../workspace"      # local workspace on laptop
+CONT_WS="/home/pi/workspace"
+WS="$SCRIPT_DIR/../workspace"
 BUILD="build"
 DS_ROOT="$CONT_WS/vision/datasets"
 
-# EXEC_PREFIX — command prefix for all cluster operations:
-#   Docker mode : "docker exec -u pi rpic_master"
-#   Native mode : "ssh -o BatchMode=yes rpi-master@<IP>"
 EXEC_PREFIX="docker exec -u pi rpic_master"
 
 if [[ $NATIVE -eq 1 ]]; then
     RPI_CONFIG="$SCRIPT_DIR/../rpi/config.env"
-    # Auto-generate config if missing
     if [[ ! -f "$RPI_CONFIG" ]] || grep -q "__FILL_IN__" "$RPI_CONFIG" 2>/dev/null; then
         echo "  config.env missing — running gen_config.sh..."
         bash "$SCRIPT_DIR/../rpi/gen_config.sh" \
             || { echo "[FATAL] gen_config.sh failed"; exit 1; }
     fi
     source "$RPI_CONFIG"
-    # Expand tilde: get the real absolute path on the Pi
+    _q_ws=$(printf '%q' "${RPI_WORKSPACE_DIR}")
     NATIVE_WS=$(ssh "${MASTER_USER}@${MASTER_IP}" \
-        "echo ${RPI_WORKSPACE_DIR}" 2>/dev/null) \
+        "bash -lc \"echo ${_q_ws}\"" 2>/dev/null) \
         || { echo "[FATAL] Cannot SSH to ${MASTER_USER}@${MASTER_IP}. Check config.env and SSH keys."; exit 1; }
+    unset _q_ws
     CONT_WS="$NATIVE_WS"
     DS_ROOT="$NATIVE_WS/vision/datasets"
     EXEC_PREFIX="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new ${MASTER_USER}@${MASTER_IP}"
@@ -105,13 +99,9 @@ if [[ $VERIFY -eq 1 ]]; then
         echo "[VERIFY] No log found at $LOG_FILE — run without --verify first"
         exit 1
     fi
-    echo "[VERIFY] Re-running report generator from: $LOG_FILE"
-    python3 "$SCRIPT_DIR/generate_report.py" \
-        --log           "$LOG_FILE" \
-        --outdir        "$REPORT_DIR" \
-        --node-counts   "${NODE_COUNTS[*]}" \
-        --thread-counts "${THREAD_COUNTS[*]}"
-    exit $?
+    echo "[VERIFY] Log is at: $LOG_FILE"
+    echo "  Run manually: python3 $SCRIPT_DIR/generate_report.py --log $LOG_FILE --outdir $REPORT_DIR --node-counts \"${NODE_COUNTS[*]}\" --thread-counts \"${THREAD_COUNTS[*]}\""
+    exit 0
 fi
 
 : > "$LOG_FILE"
@@ -126,12 +116,16 @@ log "Started : $(date)"
 log "Nodes   : ${NODE_COUNTS[*]}"
 log "Threads : ${THREAD_COUNTS[*]}"
 log "Timeout : ${TIMEOUT_SECS}s per run"
-log "Mode    : $([ $NATIVE -eq 1 ] && echo 'Native RPi (SSH)' || echo 'Docker (local)')"
-log "COCO    : $([ $WITH_COCO -eq 1 ] && echo enabled || echo 'disabled -- use --with-coco to enable')"
+log "Mode    : $([ $NATIVE -eq 1 ] && echo 'Native RPi (SSH)' || echo 'Docker containers (local)')"
+if [[ $NATIVE -eq 1 ]]; then
+    log "Hosts   : SSH ${MASTER_USER}@${MASTER_IP} (mpirun --host uses IPs)"
+else
+    log "Hosts   : Docker containers rpic_master/rpic_worker* (mpirun --host uses master/workerN)"
+fi
 
 MAX_NODES="${NODE_COUNTS[-1]}"
 
-# ── hostlist_for — works in both Docker and Native modes ─────────────────────
+# ── hostlist_for ──────────────────────────────────────────────────────────────
 hostlist_for() {
     local n="$1"
     if [[ $NATIVE -eq 1 ]]; then
@@ -146,17 +140,26 @@ hostlist_for() {
     fi
 }
 
-# ── Run helper with timeout guard ─────────────────────────────────────────────
+# ── runc: run an MPI command with optional timeout ────────────────────────────
 runc() {
     local nodes="$1" bin="$2"; shift 2
     local args="${*:-}"
     local hostlist
     hostlist="$(hostlist_for "$nodes")"
+
+    # In native mode use the shared bin path so the binary exists on all nodes.
+    local bin_path
+    if [[ $NATIVE -eq 1 ]]; then
+        bin_path="${RPI_SHARED_BIN}/$(basename "${bin}")"
+    else
+        bin_path="${CONT_WS}/${bin}"
+    fi
+
     log "  [RUN] $bin  nodes=$nodes  args=$args"
 
-    local cmd="cd $CONT_WS && \
+    local cmd="cd ${CONT_WS} && \
         mpirun --allow-run-as-root -n ${nodes} --host ${hostlist} \
-        ${CONT_WS}/${bin} ${args}"
+        ${bin_path} ${args}"
 
     if [[ "${TIMEOUT_SECS:-0}" -gt 0 ]]; then
         timeout "$TIMEOUT_SECS" \
@@ -179,20 +182,19 @@ compile_binary() {
     local src_stem="$1" out_name="$2"
     log "  [COMPILE] $src_stem → $out_name"
     $EXEC_PREFIX bash -c \
-        "cd $CONT_WS && \
-         mkdir -p \$(dirname $out_name) && \
+        "cd ${CONT_WS} && \
+         mkdir -p \$(dirname ${out_name}) && \
          mpic++ -std=c++17 -O2 -fopenmp -I./vision/shared ${src_stem}.cpp -o ${out_name} -lm" \
         2>&1 | tee -a "$LOG_FILE" \
     || log "  [WARN] Compile failed for $src_stem"
 }
 
-# ── Ensure datasets exist (laptop or Pi) ──────────────────────────────────────
+# ── ensure_datasets ───────────────────────────────────────────────────────────
 ensure_datasets() {
     local LOCAL_DS="$WS/vision/datasets"
     local -a needed=("$@")
 
     if [[ $NATIVE -eq 1 ]]; then
-        # Native mode: check Pi, rsync from laptop if missing
         local REMOTE_DS="$NATIVE_WS/vision/datasets"
         $EXEC_PREFIX mkdir -p "$REMOTE_DS" 2>/dev/null || true
         for ds in "${needed[@]}"; do
@@ -213,10 +215,8 @@ ensure_datasets() {
             fi
         done
     else
-        # Docker mode: run centralized downloader inside container
         local DL_FLAGS=""
         [[ $FIX -eq 1 ]] && DL_FLAGS="--fix"
-        [[ $WITH_COCO -eq 1 ]] && DL_FLAGS="$DL_FLAGS --coco"
         local needed_flags=""
         for ds in "${needed[@]}"; do
             case "$ds" in
@@ -231,15 +231,59 @@ ensure_datasets() {
     fi
 }
 
-# ── ensure_build_on_pi: deploy source + compile if binaries missing ───────────
+required_binaries_ok() {
+    local verbose="${1:-0}"
+    local -a rel_bins=(
+        "$BUILD/baselines"
+        "$BUILD/sobel_arch1" "$BUILD/sobel_arch2" "$BUILD/sobel_arch3" "$BUILD/sobel_arch4"
+        "$BUILD/canny_arch1" "$BUILD/canny_arch2" "$BUILD/canny_arch3"
+        "$BUILD/log_arch1"   "$BUILD/log_arch2"   "$BUILD/log_arch3"   "$BUILD/log_arch4"
+        "$BUILD/fft_arch1"   "$BUILD/fft_arch2"   "$BUILD/fft_arch3"   "$BUILD/fft_arch4"
+    )
+    local ok=1
+    for rel in "${rel_bins[@]}"; do
+        local abs
+        if [[ $NATIVE -eq 1 ]]; then
+            abs="${RPI_SHARED_BIN}/$(basename "${rel}")"
+        else
+            abs="$CONT_WS/$rel"
+        fi
+        if ! $EXEC_PREFIX test -s "$abs" 2>/dev/null || ! $EXEC_PREFIX test -x "$abs" 2>/dev/null; then
+            [[ "$verbose" -eq 1 ]] && log "  [WARN] Missing or non-executable binary: $abs"
+            ok=0
+        fi
+    done
+    [[ $ok -eq 1 ]]
+}
+
 ensure_build_on_pi() {
-    if [[ $FIX -eq 1 ]] || ! $EXEC_PREFIX test -f "$NATIVE_WS/build/sobel_arch1" 2>/dev/null; then
-        log "  Binaries missing on Pi (or --fix) — running deploy..."
+    if [[ $FIX -eq 1 ]]; then
+        log "  --fix set — running deploy..."
         bash "$SCRIPT_DIR/../rpi/deploy.sh" 2>&1 | tee -a "$LOG_FILE"
-        log "  ✓ Deploy complete"
-    else
+        if required_binaries_ok 0; then
+            log "  ✓ Deploy complete"
+            SKIP_BUILD=1
+        else
+            log "  [WARN] Deploy finished but required binaries are still missing."
+            required_binaries_ok 1 || true
+        fi
+        return 0
+    fi
+
+    if required_binaries_ok 0; then
         log "  Binaries already on Pi ✓"
         SKIP_BUILD=1
+        return 0
+    fi
+
+    log "  Binaries missing on Pi — running deploy..."
+    bash "$SCRIPT_DIR/../rpi/deploy.sh" 2>&1 | tee -a "$LOG_FILE"
+    if required_binaries_ok 0; then
+        log "  ✓ Deploy complete"
+        SKIP_BUILD=1
+    else
+        log "  [WARN] Deploy finished but required binaries are still missing."
+        required_binaries_ok 1 || true
     fi
 }
 
@@ -261,7 +305,7 @@ if [[ $NATIVE -eq 0 ]]; then
     fi
 fi
 
-# ── Docker cluster helpers (Docker mode only) ─────────────────────────────────
+# ── Docker cluster helpers ─────────────────────────────────────────────────────
 master_running() {
     local status
     status=$(docker inspect --format '{{.State.Status}}' rpic_master 2>/dev/null)
@@ -327,46 +371,42 @@ fi
 # ── Step 2: Dataset management ───────────────────────────────────────────────
 section "STEP 2: Dataset management (--fix=$FIX)"
 IMAGES=()
-NEEDED_DS=("cifar-10" "tiny-imagenet-200")
-[[ $WITH_COCO -eq 1 ]] && NEEDED_DS+=("coco-val2017")
+NEEDED_DS=("cifar-10" "tiny-imagenet-200" "coco-val2017")
 
 if [[ -n "$CUSTOM_IMAGE" ]]; then
-    $EXEC_PREFIX test -f "$CUSTOM_IMAGE" 2>/dev/null \
+    $EXEC_PREFIX test -s "$CUSTOM_IMAGE" 2>/dev/null \
         || die "Custom image not found: $CUSTOM_IMAGE"
     IMAGES=("$CUSTOM_IMAGE")
 else
-    ensure_datasets "${NEEDED_DS[@]}"
+    ensure_datasets "${NEEDED_DS[@]}" || die "Dataset provisioning failed"
 
-    CIFAR_IMG=$($EXEC_PREFIX bash -c "find '$DS_ROOT/cifar-10' -name '*.jpg' -o -name '*.png' | head -1" 2>/dev/null || true)
-    TINY_IMG=$($EXEC_PREFIX bash -c "find '$DS_ROOT/tiny-imagenet-200' -name '*.jpg' -o -name '*.JPEG' | head -1" 2>/dev/null || true)
+    CIFAR_IMG=$($EXEC_PREFIX bash -c "find '${DS_ROOT}/cifar-10' -type f \\\( -name '*.jpg' -o -name '*.png' \\\) -size +0c 2>/dev/null | head -1" 2>/dev/null || true)
+    TINY_IMG=$($EXEC_PREFIX bash -c "find '${DS_ROOT}/tiny-imagenet-200' -type f \\\( -name '*.jpg' -o -name '*.JPEG' \\\) -size +0c 2>/dev/null | head -1" 2>/dev/null || true)
+    COCO_IMG=$($EXEC_PREFIX bash -c "find '${DS_ROOT}/coco-val2017' -type f -name '*.jpg' -size +0c 2>/dev/null | head -1" 2>/dev/null || true)
 
-    for img in "$CIFAR_IMG" "$TINY_IMG"; do
-        [[ -n "$img" ]] && IMAGES+=("$img")
+    for img in "$CIFAR_IMG" "$TINY_IMG" "$COCO_IMG"; do
+        if [[ -n "$img" ]]; then
+            if $EXEC_PREFIX test -s "$img" 2>/dev/null; then
+                IMAGES+=("$img")
+            else
+                log "  [WARN] Selected dataset image is empty/missing: $img"
+            fi
+        fi
     done
-
-    if [[ $WITH_COCO -eq 1 ]]; then
-        COCO_IMG=$($EXEC_PREFIX bash -c "find '$DS_ROOT/coco-val2017' -name '*.jpg' | head -1" 2>/dev/null || true)
-        [[ -n "$COCO_IMG" ]] && IMAGES+=("$COCO_IMG")
-    else
-        log "  [SKIP] COCO-Val2017 skipped (pass --with-coco to enable)"
-    fi
 
     [[ ${#IMAGES[@]} -eq 0 ]] && die "No dataset images available — check datasets or run with --fix"
     log "  Running on ${#IMAGES[@]} image(s): ${IMAGES[*]}"
 fi
 
-
 # ── Step 3: Build all binaries ────────────────────────────────────────────────
-# Auto-skip if a previous build succeeded and --fix was not given.
-# A successful build writes a sentinel file; --fix or explicit --skip-build=0
-# forces a rebuild and refreshes the sentinel.
-
-BUILD_SENTINEL="$SCRIPT_DIR/.build_ok"
-
 if [[ $SKIP_BUILD -eq 0 && $FIX -eq 0 && -f "$BUILD_SENTINEL" ]]; then
-    log "  [AUTO] Skipping build — sentinel present ($BUILD_SENTINEL)."
-    log "         Delete the sentinel or pass --fix to force a rebuild."
-    SKIP_BUILD=1
+    if required_binaries_ok 0; then
+        log "  [AUTO] Skipping build — sentinel present ($BUILD_SENTINEL)."
+        SKIP_BUILD=1
+    else
+        log "  [WARN] Build sentinel present but binaries missing — rebuilding."
+        rm -f "$BUILD_SENTINEL"
+    fi
 fi
 
 if [[ $SKIP_BUILD -eq 0 ]]; then
@@ -380,24 +420,29 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
     compile_binary "vision/canny/canny_arch2_pipeline"    "$BUILD/canny_arch2"
     compile_binary "vision/canny/canny_arch3_scatter"     "$BUILD/canny_arch3"
     compile_binary "vision/canny/canny_arch4_pipeline"    "$BUILD/canny_arch4"
-    compile_binary "vision/log/log_arch1_farm"          "$BUILD/log_arch1"
-    compile_binary "vision/log/log_arch2_pipeline"      "$BUILD/log_arch2"
-    compile_binary "vision/log/log_arch3_scatter"       "$BUILD/log_arch3"
-    compile_binary "vision/log/log_arch4_pipeline"      "$BUILD/log_arch4"
-    compile_binary "vision/fft/fft_arch1_farm"          "$BUILD/fft_arch1"
-    compile_binary "vision/fft/fft_arch2_pipeline"      "$BUILD/fft_arch2"
-    compile_binary "vision/fft/fft_arch3_dist_dynamic"  "$BUILD/fft_arch3"
-    compile_binary "vision/fft/fft_arch4_dist_pipeline" "$BUILD/fft_arch4"
+    compile_binary "vision/log/log_arch1_farm"            "$BUILD/log_arch1"
+    compile_binary "vision/log/log_arch2_pipeline"        "$BUILD/log_arch2"
+    compile_binary "vision/log/log_arch3_scatter"         "$BUILD/log_arch3"
+    compile_binary "vision/log/log_arch4_pipeline"        "$BUILD/log_arch4"
+    compile_binary "vision/fft/fft_arch1_farm"            "$BUILD/fft_arch1"
+    compile_binary "vision/fft/fft_arch2_pipeline"        "$BUILD/fft_arch2"
+    compile_binary "vision/fft/fft_arch3_dist_dynamic"    "$BUILD/fft_arch3"
+    compile_binary "vision/fft/fft_arch4_dist_pipeline"   "$BUILD/fft_arch4"
     log "All binaries compiled into workspace/$BUILD/"
-    # Mark build as done so next run skips automatically
-    touch "$BUILD_SENTINEL"
+    if required_binaries_ok 0; then
+        touch "$BUILD_SENTINEL"
+    else
+        log "  [WARN] Not writing build sentinel — one or more binaries are missing."
+        required_binaries_ok 1 || true
+        rm -f "$BUILD_SENTINEL"
+    fi
 else
     section "STEP 3: Build (skipped)"
     log "  Using existing binaries in workspace/$BUILD/"
 fi
 
 OUT_CONT="$CONT_WS/results/out"
-$EXEC_PREFIX bash -c "mkdir -p $OUT_CONT" 2>/dev/null || true
+$EXEC_PREFIX bash -c "mkdir -p ${OUT_CONT}" 2>/dev/null || true
 
 # ── Step 4: Serial baselines ──────────────────────────────────────────────────
 section "STEP 4: Serial Baselines"
@@ -407,10 +452,6 @@ for img in "${IMAGES[@]}"; do
 done
 
 # ── Per-filter runner ─────────────────────────────────────────────────────────
-# Binaries use original positional args: <img> <param> <output.png>
-# One mpirun per image keeps compatibility; the speed gains from earlier
-# changes (COCO opt-out, build sentinel, RAM check) still apply.
-
 run_filter_all() {
     local tag="$1" b1="$2" b2="$3" b3="$4" b4="$5"
 
@@ -419,18 +460,15 @@ run_filter_all() {
         local stem
         stem=$(basename "$img" | sed 's/\.[^.]*$//')
 
-        # Arch1: OMP Farm  <img> <threads> <output.png>
         for t in "${THREAD_COUNTS[@]}"; do
-            runc 1 "$b1" "$img $t $OUT_CONT/${tag}_arch1_t${t}_${stem}.png"
+            runc 1 "$b1" "$img $t ${OUT_CONT}/${tag}_arch1_t${t}_${stem}.png"
         done
 
-        # Arch2: OMP Pipeline  <img> <chunk_rows> <output.png>
-        runc 1 "$b2" "$img 32 $OUT_CONT/${tag}_arch2_${stem}.png"
+        runc 1 "$b2" "$img 32 ${OUT_CONT}/${tag}_arch2_${stem}.png"
 
-        # Arch3 / Arch4: MPI  <img> <output.png>
         for n in "${NODE_COUNTS[@]}"; do
-            runc "$n" "$b3" "$img $OUT_CONT/${tag}_arch3_n${n}_${stem}.png"
-            runc "$n" "$b4" "$img $OUT_CONT/${tag}_arch4_n${n}_${stem}.png"
+            runc "$n" "$b3" "$img ${OUT_CONT}/${tag}_arch3_n${n}_${stem}.png"
+            runc "$n" "$b4" "$img ${OUT_CONT}/${tag}_arch4_n${n}_${stem}.png"
         done
     done
 }
@@ -445,11 +483,11 @@ for img in "${IMAGES[@]}"; do
     stem=$(basename "$img" | sed 's/\.[^.]*$//')
 
     for t in "${THREAD_COUNTS[@]}"; do
-        runc 1 "$BUILD/canny_arch1" "$img $t $OUT_CONT/canny_arch1_t${t}_${stem}.png"
+        runc 1 "$BUILD/canny_arch1" "$img $t ${OUT_CONT}/canny_arch1_t${t}_${stem}.png"
     done
-    runc 1 "$BUILD/canny_arch2" "$img 32 $OUT_CONT/canny_arch2_${stem}.png"
+    runc 1 "$BUILD/canny_arch2" "$img 32 ${OUT_CONT}/canny_arch2_${stem}.png"
     for n in "${NODE_COUNTS[@]}"; do
-        runc "$n" "$BUILD/canny_arch3" "$img $OUT_CONT/canny_arch3_n${n}_${stem}.png"
+        runc "$n" "$BUILD/canny_arch3" "$img ${OUT_CONT}/canny_arch3_n${n}_${stem}.png"
     done
 done
 log "  [NOTE] Canny Arch4 (batch-only) → run run_analysis_bsds.sh for throughput"
@@ -462,35 +500,26 @@ section "STEP 8: FFT — All Architectures"
 for img in "${IMAGES[@]}"; do
     log "IMAGE: $img"
 
-    # Arch1: <img> [num_threads]
     for t in "${THREAD_COUNTS[@]}"; do
         runc 1 "$BUILD/fft_arch1" "$img $t"
     done
 
-    # Arch2: <img>
     runc 1 "$BUILD/fft_arch2" "$img"
 
-    # Arch3 / Arch4: <img>
     for n in "${NODE_COUNTS[@]}"; do
         runc "$n" "$BUILD/fft_arch3" "$img"
         runc "$n" "$BUILD/fft_arch4" "$img"
     done
 done
 
-# ── Step 9: Generate report ───────────────────────────────────────────────────
-section "STEP 9: Generating Report"
-if command -v python3 &>/dev/null; then
-    python3 "$SCRIPT_DIR/generate_report.py" \
-        --log "$LOG_FILE" \
-        --outdir "$REPORT_DIR" \
-        --node-counts "${NODE_COUNTS[*]}" \
-        --thread-counts "${THREAD_COUNTS[*]}" \
-        2>&1 | tee -a "$LOG_FILE"
-else
-    log "[WARN] python3 not found — run generate_report.py manually"
-fi
-
 section "ANALYSIS COMPLETE"
 log "Log file  : $LOG_FILE"
 log "Report dir: $REPORT_DIR/"
 log "Finished  : $(date)"
+log ""
+log "  To generate report run:"
+log "    python3 $SCRIPT_DIR/generate_report.py \\"
+log "        --log $LOG_FILE \\"
+log "        --outdir $REPORT_DIR \\"
+log "        --node-counts \"${NODE_COUNTS[*]}\" \\"
+log "        --thread-counts \"${THREAD_COUNTS[*]}\""
