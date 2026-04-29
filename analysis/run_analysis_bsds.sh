@@ -94,6 +94,11 @@ if [[ $NATIVE -eq 1 ]]; then
     EXEC_PREFIX="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new ${MASTER_USER}@${MASTER_IP}"
 fi
 
+if [[ $NATIVE -eq 1 ]]; then
+    OUT_DIR="$SCRIPT_DIR/report_bsds_rpi"
+    LOG_FILE="$OUT_DIR/analysis_bsds_rpi.log"
+fi
+
 mkdir -p "$OUT_DIR"
 
 # ── Verify shortcut ───────────────────────────────────────────────────────────
@@ -222,7 +227,17 @@ ensure_datasets() {
         local REMOTE_DS="$NATIVE_WS/vision/datasets"
         $EXEC_PREFIX mkdir -p "$REMOTE_DS" 2>/dev/null || true
         for ds in "${needed[@]}"; do
+            # For BSDS500, also re-sync if groundTruth_png is missing (images may exist but GT may not)
+            local needs_sync=0
             if ! $EXEC_PREFIX test -d "$REMOTE_DS/$ds" 2>/dev/null; then
+                needs_sync=1
+            elif [[ "$ds" == "BSDS500" ]] && \
+                 ! $EXEC_PREFIX test -d "$REMOTE_DS/$ds/groundTruth_png" 2>/dev/null; then
+                log "  Dataset '$ds' on Pi is missing groundTruth_png — re-syncing..."
+                needs_sync=1
+            fi
+
+            if [[ $needs_sync -eq 1 ]]; then
                 log "  Dataset '$ds' missing on Pi — pushing from laptop..."
                 if [[ -d "$LOCAL_DS/$ds" ]]; then
                     rsync -az --info=progress2 \

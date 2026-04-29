@@ -26,6 +26,8 @@ import re
 import sys
 from collections import defaultdict
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 try:
     import matplotlib
     matplotlib.use("Agg")
@@ -902,8 +904,8 @@ def write_csv(data, outdir):
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Generate multi-size analysis report")
-    parser.add_argument("--log",           default="analysis_results.log")
-    parser.add_argument("--outdir",        default="report")
+    parser.add_argument("--log",           default=os.path.join(SCRIPT_DIR, "analysis_results.log"))
+    parser.add_argument("--outdir",        default=os.path.join(SCRIPT_DIR, "report"))
     parser.add_argument("--workspace",     default="workspace")
     parser.add_argument("--node-counts",   default="2 4 6")
     parser.add_argument("--thread-counts", default="1 2 4")

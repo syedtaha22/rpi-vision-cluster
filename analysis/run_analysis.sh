@@ -91,6 +91,11 @@ if [[ $NATIVE -eq 1 ]]; then
     EXEC_PREFIX="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new ${MASTER_USER}@${MASTER_IP}"
 fi
 
+if [[ $NATIVE -eq 1 ]]; then
+    LOG_FILE="$SCRIPT_DIR/analysis_rpi_results.log"
+    REPORT_DIR="$SCRIPT_DIR/report_rpi"
+fi
+
 mkdir -p "$REPORT_DIR" "$WS/results/out"
 
 # ── Verify shortcut ───────────────────────────────────────────────────────────

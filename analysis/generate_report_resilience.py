@@ -23,6 +23,8 @@ import os
 import re
 import sys
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 try:
     import matplotlib
     matplotlib.use("Agg")
@@ -480,9 +482,9 @@ def write_csv(res, scenarios, outdir):
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Resilience Analysis Report")
-    parser.add_argument("--log",            default="report_resilience/analysis_resilience.log")
-    parser.add_argument("--outdir",         default="report_resilience")
-    parser.add_argument("--resilience-dir", default="report_resilience/resilience_images")
+    parser.add_argument("--log",            default=os.path.join(SCRIPT_DIR, "report_resilience/analysis_resilience.log"))
+    parser.add_argument("--outdir",         default=os.path.join(SCRIPT_DIR, "report_resilience"))
+    parser.add_argument("--resilience-dir", default=os.path.join(SCRIPT_DIR, "report_resilience/resilience_images"))
     parser.add_argument("--nodes",          type=int, default=6)
     args = parser.parse_args()
 

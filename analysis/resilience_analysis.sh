@@ -86,6 +86,11 @@ if [[ $NATIVE -eq 1 ]]; then
     EXEC_PREFIX="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new ${MASTER_USER}@${MASTER_IP}"
 fi
 
+if [[ $NATIVE -eq 1 ]]; then
+    OUT_DIR="$SCRIPT_DIR/report_resilience_rpi"
+    LOG_FILE="$OUT_DIR/analysis_resilience_rpi.log"
+fi
+
 mkdir -p "$OUT_DIR" "$WS/results/resilience"
 
 # ── Verify shortcut ───────────────────────────────────────────────────────────

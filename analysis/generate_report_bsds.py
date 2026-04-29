@@ -31,6 +31,8 @@ import re
 import sys
 from collections import defaultdict
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 try:
     import matplotlib
     matplotlib.use("Agg")
@@ -1349,9 +1351,9 @@ def write_csv(all_data, outdir):
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="BSDS500 Analysis Report Generator")
-    parser.add_argument("--log",           default="report_bsds/analysis_bsds.log")
-    parser.add_argument("--outdir",        default="report_bsds")
-    parser.add_argument("--recon-dir",     default="report_bsds/reconstructed")
+    parser.add_argument("--log",           default=os.path.join(SCRIPT_DIR, "report_bsds/analysis_bsds.log"))
+    parser.add_argument("--outdir",        default=os.path.join(SCRIPT_DIR, "report_bsds"))
+    parser.add_argument("--recon-dir",     default=os.path.join(SCRIPT_DIR, "report_bsds/reconstructed"))
     parser.add_argument("--orig-dir",      default="",
                         help="Directory of original BSDS test images for side-by-side comparison")
     parser.add_argument("--gt-dir",        default="")
