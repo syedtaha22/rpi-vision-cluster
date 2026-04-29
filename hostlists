@@ -1,0 +1,7 @@
+# Syntax: [hostname/IP] slots=[number_of_cores]
+localhost  slots=4
+rpi-worker1@rpi-worker1.local slots=4
+rpi-worker2@rpi-worker2.local slots=4
+rpi-worker3@rpi-worker3.local slots=4
+rpi-worker4@rpi-worker4.local slots=4
+rpi-worker5@rpi-worker5.local slots=4

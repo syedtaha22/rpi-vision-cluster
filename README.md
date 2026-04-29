@@ -1,344 +1,221 @@
 # RPI Vision Cluster
 
-A distributed image processing system built on a Raspberry Pi cluster using MPI (Message Passing Interface). This project simulates a Raspberry Pi cluster environment using Docker with ARM64 emulation, enabling development and testing on x86 machines.
+A distributed image processing system built on a Raspberry Pi cluster using MPI (Message Passing Interface) over a cluster of Raspberry Pi nodes.
 
 ## Project Structure
 
 ```
 rpi-vision-cluster/
-├── Makefile                  # Cluster management & compilation commands
-├── Dockerfile.cluster        # Container configuration with MPI, SSH, Python
-├── docker-compose.yml        # Scalable cluster definition (2-6 nodes)
 ├── README.md                 # This file
+├── hostlists                 # MPI hostlist configuration
 │
-└── workspace/                # All files here are mounted in cluster containers
-    ├── hello_cluster.py      # MPI test script
-    └── examples/             # Example MPI programs
-        ├── matrix_multiply.c     # 800x800 matrix multiplication with profiling
-        └── mpi_latency_test.c    # Communication benchmark (ping-pong, all-to-all)
+├── examples/                 # Example MPI programs
+│   ├── hello_cluster.c       # Basic MPI test
+│   ├── matrix_multiply.c     # Matrix multiplication with profiling
+│   └── mpi_latency_test.c    # Communication benchmark
+│
+└── scripts/                  # Cluster management utilities
+    ├── globals.sh           # Shared configuration
+    ├── init.sh              # Initialize entire cluster
+    ├── init_pi.sh           # Per-node setup (auto-detects master vs worker)
+    ├── test.sh              # Test connectivity to all nodes
+    ├── upload.sh            # Upload files to master's NFS share
+    └── pswdless_ssh.sh      # Setup passwordless SSH
 ```
+
+## Prerequisites
+
+### Hardware
+- Raspberry Pi cluster with hostnames: `rpi-master`, `rpi-worker1` through `rpi-worker<N>`
+- Network connectivity between all nodes
+
+### Device Configuration
+Each Raspberry Pi must be configured using the Raspberry Pi Imager with the following settings:
+- **OS:** Raspberry Pi OS Lite (64-bit)
+- **Enable SSH:** Yes
+- **Hostname:** `rpi-master` (master), `rpi-worker1`, `rpi-worker2`, etc. (workers)
+- **Username/Password:** Same as hostname (e.g., username=`rpi-master`, password=`rpi-master`)
+- **Network:** WiFi or Ethernet connection to same network
+
+### Development Machine
+- Connected to the same network as the cluster
+- SSH installed
+- MPI development tools: `mpicc`, `mpic++`, `mpirun`
 
 ---
 
-## Quick Start
+## Setup Workflow
 
-### 0. Prerequisites
-- Docker version 29.2.1 or later
-- Docker Compose version 5.0.2 or later
-- 8GB+ RAM recommended
-- 10GB+ disk space for images
+### Step 1: Test Connectivity
 
-### 1. Makefile Commands
-
-The Makefile provides simple commands for all cluster operations. Run `make help` to see all available commands:
-
-```
-RPI Vision Cluster - Makefile Commands
-
-Setup:
-  make setup [NODES=2]  - Enable ARM64 emulation and build cluster (2-6 nodes)
-  make start [NODES=2]  - Start the cluster containers (2-6 nodes)
-  make stop             - Stop the cluster containers
-  make restart [NODES=2]- Restart the cluster with specified nodes
-
-Testing:
-  make verify     - Verify cluster is working
-  make test       - Run MPI test (hello_cluster.py)
-  make shell      - Open shell on master node
-
-Compilation:
-  make compile FILE=<file.c> [OUTPUT=name] - Compile C/C++ in cluster (ARM64 MPI)
-  make run FILE=<file> [NODES=2]        - Run program (binary or .py) on cluster
-
-Maintenance:
-  make logs       - Show container logs
-  make clean      - Stop and remove containers (keep images)
-  make destroy    - Complete removal (containers, volumes, images)
-
-Note: workspace/ folder is mounted at /home/pi/workspace/ on all nodes
-      Place source files in workspace/ and binaries will be compiled there
-
-Examples:
-  make setup NODES=4                         - Start cluster with 1 master + 3 workers
-  make compile FILE=matrix_multiply.c        - Compile C program in workspace/
-  make run FILE=matrix_multiply NODES=4      - Run compiled binary on 4 nodes
-  make run FILE=hello_cluster.py NODES=3     - Run Python script on 3 nodes
-```
-
-### 2. One-Command Setup
+Verify all nodes are reachable from your dev machine:
 
 ```bash
-make setup          # Default: 2 nodes (1 master + 1 worker)
-make setup NODES=4  # 4 nodes (1 master + 3 workers)
-```
-
-This command will:
-1. Enable ARM64 emulation (if needed)
-2. Build and launch the cluster containers
-3. Configure MPI and SSH automatically
-4. Verify the setup
-
-**Node Configuration:**
-- Minimum: 2 nodes (1 master + 1 worker)
-- Maximum: 6 nodes (1 master + 5 workers)
-- Default: 2 nodes if not specified
-
-### 3. Verify Installation
-
-```bash
-make test NODES=2
+./scripts/test.sh
+./scripts/test.sh -n 3    # If testing with fewer workers
 ```
 
 Expected output:
 ```
-Hello from rank 0 of 2 on host master
-Hello from rank 1 of 2 on host worker1
-Success! Cluster nodes found: ['master', 'worker1']
+Result: success=6 fail=0
 ```
 
-**Note:** All workspace files are automatically available in containers at `/home/pi/workspace/` - no manual copying needed.
+If any nodes fail, check network connectivity and hostname resolution before proceeding.
 
----
+### Step 2: Setup Passwordless SSH from Dev Machine
 
-## Working with the Cluster
-
-### Start/Stop the Cluster
+Configure SSH keys on your dev machine for all cluster nodes:
 
 ```bash
-# Start with default 2 nodes
-make start
-
-# Start with specific node count
-make start NODES=4
-
-# Stop all containers
-make stop
-
-# Restart with specific node count
-make restart NODES=3
-
-# Remove everything
-make destroy
+./scripts/pswdless_ssh.sh -a
 ```
 
-### Access the Master Node
+This script:
+- Generates SSH keys (if not present)
+- Copies keys to rpi-master and all rpi-worker nodes
+- Sets correct permissions
+
+You'll be prompted for Pi passwords during this process. Run it again to verify passwordless SSH is working.
+
+### Step 3: Initialize Cluster
+
+Install MPI, build tools, and NFS on all nodes:
 
 ```bash
-make shell
+./scripts/init.sh
 ```
 
-Inside the container, all workspace files are available at `/home/pi/workspace/`.
+This script:
+- Uploads init_pi.sh to all nodes
+- Configures NFS server on master node
+- Mounts NFS on all worker nodes
+- Creates shared folder `/rpi-vision-cluster` accessible from all nodes
+- Uploads hostlist for MPI
 
-### Check Status
+Wait for completion. Each node initializes sequentially.
+
+### Step 4: Setup Master-to-Worker Passwordless SSH
+
+Master node needs passwordless SSH to workers for MPI to function. Copy and run the setup script:
 
 ```bash
-make status
+./scripts/upload.sh ./scripts/pswdless_ssh.sh
+ssh rpi-master@rpi-master.local "sudo bash /rpi-vision-cluster/pswdless_ssh.sh"
 ```
 
----
+Without the `-a` flag, the script runs in "local" mode, setting up SSH between master and workers on the cluster.
 
-## Compiling and Running Programs
+### Step 5: Verify Setup
 
-### Workspace Access
-
-All files in the `workspace/` folder are automatically mounted to `/home/pi/workspace/` in all containers. Place your programs in the workspace/ directory to make them available to the cluster.
-
-### Python Programs
+Test connectivity again to ensure everything is working:
 
 ```bash
-# Run Python script directly
-make run FILE=hello_cluster.py NODES=2
-make run FILE=hello_cluster.py NODES=3
+./scripts/test.sh
 ```
 
-### C/C++ Programs
+Check that NFS is mounted on all nodes:
 
 ```bash
-# Compile for cluster (ARM64 with MPI)
-make compile FILE=examples/matrix_multiply.c OUTPUT=matmul
-
-# Run compiled binary
-make run FILE=matmul NODES=2
-make run FILE=matmul NODES=5
-```
-
-### Advanced: Manual Execution
-
-```bash
-# Enter the master container
-make shell
-
-# Inside container, workspace is at /home/pi/workspace/
-cd /home/pi/workspace/
-
-# Compile
-mpicc examples/matrix_multiply.c -o matmul -lm
-
-# Run with custom MPI options
-mpirun -n 4 --host master,worker1,worker2,worker3 ./matmul
+ssh rpi-master@rpi-master.local "ls /rpi-vision-cluster/"
+ssh rpi-worker1@rpi-worker1.local "ls /rpi-vision-cluster/"
 ```
 
 ---
 
-## Makefile Command Reference
+## Post-Setup Workflow
 
-### Cluster Lifecycle
+Once cluster is set up, the typical workflow is:
 
-| Command | Description | Example |
-|---------|-------------|---------|
-| `make setup` | Build and start cluster | `make setup NODES=4` |
-| `make start` | Start existing cluster | `make start NODES=2` |
-| `make stop` | Stop all containers | `make stop` |
-| `make restart` | Stop and start | `make restart NODES=3` |
-| `make clean` | Remove containers (keep images) | `make clean` |
-| `make destroy` | Remove containers and images | `make destroy` |
+```bash
+# 1. Compile MPI program on dev machine
+mpicc examples/hello_cluster.c -o ./hello_cluster -lm -O2
 
-### Testing & Verification
+# 2. Upload binary to master (accessible to all nodes via NFS)
+./scripts/upload.sh ./hello_cluster
 
-| Command | Description | Example |
-|---------|-------------|---------|
-| `make test` | Run hello_cluster.py test | `make test NODES=3` |
-| `make verify` | Verify cluster connectivity | `make verify NODES=5` |
-| `make shell` | SSH into master node | `make shell` |
-| `make status` | Show container status | `make status` |
+# 3. Run on cluster via master
+ssh rpi-master@rpi-master.local "mpirun --hostfile /rpi-vision-cluster/hostlists /rpi-vision-cluster/hello_cluster"
+```
 
-### Compilation & Execution
+All nodes see `/rpi-vision-cluster` with the same files via NFS, eliminating file path issues across nodes.
 
-| Command | Description | Example |
-|---------|-------------|---------|
-| `make compile` | Compile C/C++ for cluster (ARM64) | `make compile FILE=prog.c OUTPUT=prog` |
-| `make run` | Run program (binary or .py) | `make run FILE=prog NODES=4` |
+---
 
-**Parameters:**
-- `NODES=N` - Number of nodes (2-6, default: 2)
-- `FILE=path` - Program file path (relative to workspace)
-- `OUTPUT=name` - Output binary name (for compile)
+## Configuration
+
+Edit `scripts/globals.sh` to customize:
+
+```bash
+MPI_SHARED="/rpi-vision-cluster"     # Shared NFS folder path
+NUM_WORKERS=5                         # Number of worker nodes
+HOSTLIST_FILE="hostlists"            # MPI hostlist filename
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+MASTER_HOST="rpi-master.local"       # Master hostname
+```
+
+---
+
+## Scripts Reference
+
+| Script | Purpose |
+|--------|---------|
+| `init.sh` | Initialize entire cluster (run once after setup) |
+| `init_pi.sh` | Per-node setup (auto-detects master vs worker via hostname) |
+| `test.sh` | Test connectivity to all nodes with ping |
+| `upload.sh` | Upload files to master's NFS shared folder |
+| `pswdless_ssh.sh` | Setup passwordless SSH (with `-a` for all nodes, or local mode for master-worker) |
+| `globals.sh` | Shared configuration and utility functions |
 
 ---
 
 ## Example Programs
 
-### 1. hello_cluster.py - MPI Synchronization Test
+### 1. hello_cluster.c - Basic MPI Test
 
-Demonstrates proper MPI synchronization using `allgather()`:
+Simple hello world program for testing basic MPI functionality:
 
 ```bash
-make run FILE=hello_cluster.py NODES=2
+# Upload source to master
+./scripts/upload.sh examples/hello_cluster.c
+
+# SSH into master
+ssh rpi-master@rpi-master.local
 ```
 
-**Why `allgather` vs `gather`?**
-- `gather(root=0)`: Only rank 0 receives data, other ranks can hang
-- `allgather()`: All ranks receive data, guaranteed synchronization
+In master's shell:
+
+```bash
+cd /rpi-vision-cluster
+mpicc examples/hello_cluster.c -o hello_cluster -lm -O2
+mpirun --hostfile hostlists ./hello_cluster
+```
+
 
 ### 2. matrix_multiply.c - Computational Benchmark
 
-800x800 matrix multiplication with MPI profiling:
+800x800 matrix multiplication with MPI profiling and performance metrics:
 
-```bash
-# Compile
-make compile FILE=examples/matrix_multiply.c OUTPUT=matmul
-
-# Run on 2 nodes
-make run FILE=matmul NODES=2
-```
-
-**Features:**
 - Row-wise matrix distribution using `MPI_Scatter`
 - Broadcast matrix B with `MPI_Bcast`
-- Internal timing with `MPI_Wtime()` showing:
+- Performance metrics:
   - Computation time (actual math)
   - Communication time (MPI overhead)
   - Per-process timing breakdown
-- GFLOPS calculation
-
-**Measured Results:**
-
-2 Nodes (1 master + 1 worker):
-```
-Matrix Size:       800x800
-Processes:         2
-Total Time:        21.6649 seconds
-Computation Time:  21.5692 seconds
-Communication Time: 0.0942 seconds
-Compute/Total:     99.56%
-Comm/Total:        0.43%
-Performance:       0.05 GFLOPS
-```
-
-5 Nodes (1 master + 4 workers):
-```
-Matrix Size:       800x800
-Processes:         5
-Total Time:        7.5548 seconds
-Computation Time:  6.9004 seconds
-Communication Time: 0.6535 seconds
-Compute/Total:     91.34%
-Comm/Total:        8.65%
-Performance:       0.15 GFLOPS
-```
-
-**Analysis:**
-- Speedup: 2.87x when going from 2 to 5 nodes
-- Communication overhead increases: 0.43% to 8.65%
-- Performance scales well due to optimized loop ordering and deterministic initialization
+  - GFLOPS calculation
 
 ### 3. mpi_latency_test.c - Communication Benchmark
 
-Measures MPI communication overhead across different patterns:
-
-```bash
-# Compile
-make compile FILE=examples/mpi_latency_test.c OUTPUT=latency_test
-
-# Run on 2 nodes
-make run FILE=latency_test NODES=2
-
-# Run on 5 nodes
-make run FILE=latency_test NODES=5
-```
+Measures MPI communication overhead across different patterns
 
 **Tests Performed:**
-1. **Ping-Pong Latency:** Round-trip time between master and worker1
+1. **Ping-Pong Latency:** Round-trip time between processes
    - Message sizes: 1B, 1KB, 10KB, 100KB, 1MB
    - 100 iterations with warmup
    - Calculates bandwidth (MB/s)
 
 2. **All-to-All Communication:** Every process sends to every other process
-   - Tests O(n²) scaling behavior
 
 3. **Broadcast Latency:** Master broadcasts to all workers
-   - Message sizes: 1KB, 100KB, 1MB
-
-**Measured Results:**
-
-2 Nodes:
-```
-Ping-Pong       | Size:       1 B | Time:    1301.72 μs
-Ping-Pong       | Size:    1024 B | Time:     114.16 μs
-Ping-Pong       | Size:   10240 B | Time:     140.65 μs
-Ping-Pong       | Size:  102400 B | Time:    1812.50 μs
-Ping-Pong       | Size: 1048576 B | Time:    1258.84 μs
-Broadcast       | Size:    1024 B | Time:     325.77 μs
-Broadcast       | Size: 1048576 B | Time:    1369.34 μs
-All-to-All      | Size:    2048 B | Time:     709.82 μs
-```
-
-5 Nodes:
-```
-Ping-Pong       | Size:       1 B | Time:     993.01 μs
-Ping-Pong       | Size:    1024 B | Time:     423.73 μs
-Ping-Pong       | Size:   10240 B | Time:     618.92 μs
-Ping-Pong       | Size:  102400 B | Time:    3710.34 μs
-Ping-Pong       | Size: 1048576 B | Time:    4045.55 μs
-Broadcast       | Size:    1024 B | Time:     958.04 μs
-Broadcast       | Size: 1048576 B | Time:   17537.10 μs
-All-to-All      | Size:    5120 B | Time:    3490.50 μs
-```
-
-**Observations:**
-- All-to-All communication scales poorly: 710μs (2 nodes) → 3491μs (5 nodes) - 4.9x increase
-- Broadcast 1MB scales poorly: 1369μs (2 nodes) → 17537μs (5 nodes) - 12.8x increase
-- Ping-Pong latency for 1MB: 1259μs (2 nodes) → 4046μs (5 nodes) - 3.2x increase
 
 ---
 
@@ -378,72 +255,49 @@ See [examples/matrix_multiply.c](examples/matrix_multiply.c) for a complete impl
 
 ---
 
-## Milestones
-
-- [x] **M0: Virtual cluster & toolchain setup**
-  - Docker-based ARM64 emulation (2-6 nodes)
-  - Automated setup with `make setup`
-  - Workspace volume mounting (no manual file copying)
-  - C/C++ and Python compilation workflows
-  - MPI latency and computation benchmarks
-- [ ] **M1: Multi-threaded single-node processing**
-- [ ] **M2: Shared memory IPC & PRAM analysis**
-- [ ] **M3: Physical cluster assembly & MPI**
-- [ ] **M4: Non-blocking communication & failover**
-- [ ] **M5: Integration & final benchmarks**
-
----
-
 ## Troubleshooting
 
-### "Container not running"
+### Nodes unreachable
 ```bash
-make start NODES=2
+# Test connectivity
+./scripts/test.sh -n 1
+
+# Test specific node
+ping rpi-master.local
+ssh rpi-master@rpi-master.local "hostname"
 ```
 
-### "Permission denied" errors
+### SSH passwordless not working
 ```bash
-docker exec -u root rpic_master chown -R pi:pi /home/pi/
+# Re-run from dev machine
+./scripts/pswdless_ssh.sh -a
+
+# Verify it worked
+ssh rpi-master@rpi-master.local "echo OK"
 ```
 
-### "SSH connection refused"
+### NFS not mounted on workers
 ```bash
-# Wait a few seconds after starting containers
-sleep 3
-docker exec -u pi rpic_master mpirun -n 2 --host master,worker1 hostname
+# Check from worker
+ssh rpi-worker1@rpi-worker1.local "mount | grep rpi-vision-cluster"
+
+# Check from master
+ssh rpi-master@rpi-master.local "showmount -a"
 ```
 
-### ARM64 emulation not working
-```bash
-# Manually enable emulation
-docker run --privileged --rm tonistiigi/binfmt --install all
+### Init script fails on a node
+- Check master is initialized first (it's always first in sequence)
+- Verify passwordless SSH is working
+- Run individually: `ssh rpi-worker1@rpi-worker1.local "sudo bash /tmp/init_pi.sh"`
 
-# Verify
-docker buildx ls
-```
-
-### View container logs
-```bash
-docker logs rpic_master
-docker logs rpic_worker1
-```
-
-### File not found errors
-```bash
-# All workspace files are automatically mounted at /home/pi/workspace/
-# Use relative paths from project root:
-make run FILE=examples/program NODES=2
-
-# Or absolute paths inside container:
-make shell
-cd /home/pi/workspace/examples/
-./program
-```
+### Files not visible on all nodes
+- Verify NFS is mounted: `ssh rpi-worker1@rpi-worker1.local "mount | grep rpi-vision-cluster"`
+- Upload files through master: `./scripts/upload.sh myfile.bin`
 
 ---
 
 ## Additional Resources
 
-- [MPI4Py Documentation](https://mpi4py.readthedocs.io/) - Python MPI library
 - [OpenMPI Documentation](https://www.open-mpi.org/) - MPI implementation
 - [MPI Tutorial](https://mpitutorial.com/) - Comprehensive MPI guide
+- [Raspberry Pi Documentation](https://www.raspberrypi.com/documentation/) - Pi setup and configuration

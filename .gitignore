@@ -2,6 +2,7 @@
 *.o
 *.out
 *.bin
+bin/
 
 # Simulation and waveform outputs
 *.vcd
