@@ -6,6 +6,10 @@
 # architecture binaries + game binary on the master, then distributes the
 # compiled binaries to all worker nodes.
 #
+# Binaries are deployed to TWO locations on every node:
+#   1. $RPI_WORKSPACE_DIR/build/  — master's own workspace build dir
+#   2. $RPI_SHARED_BIN/           — fixed path identical on all nodes (for mpirun)
+#
 # Usage:
 #   bash rpi/deploy.sh [--skip-sync] [--skip-compile] [--skip-dist]
 #
@@ -47,14 +51,24 @@ source "$CONFIG"
 WORKER_USERS=("$WORKER1_USER" "$WORKER2_USER" "$WORKER3_USER" "$WORKER4_USER" "$WORKER5_USER")
 WORKER_IPS=( "$WORKER1_IP"   "$WORKER2_IP"   "$WORKER3_IP"   "$WORKER4_IP"   "$WORKER5_IP")
 
-# Paths — driven entirely by config.env so they match every Pi's Desktop layout
-# Default: ~/Desktop/rpi-vision-cluster/workspace (overrideable in config.env)
 RPI_WORKSPACE_DIR="${RPI_WORKSPACE_DIR:-~/Desktop/rpi-vision-cluster/workspace}"
 RPI_WS_PARENT="${RPI_WS_PARENT:-~/Desktop/PDC_project}"
+# Fixed absolute path that is the same on every node regardless of username.
+# mpirun requires an identical binary path on all ranks.
+RPI_SHARED_BIN="${RPI_SHARED_BIN:-/var/tmp/pdc_build}"
+
+# Expand tildes on the remote master explicitly.
+q_ws=$(printf '%q' "$RPI_WORKSPACE_DIR")
+q_parent=$(printf '%q' "$RPI_WS_PARENT")
+RPI_WORKSPACE_DIR_EXPANDED=$(ssh "${MASTER_USER}@${MASTER_IP}" "bash -lc \"echo ${q_ws}\"" 2>/dev/null) \
+    || die "Failed to expand RPI_WORKSPACE_DIR on master"
+RPI_WS_PARENT_EXPANDED=$(ssh "${MASTER_USER}@${MASTER_IP}" "bash -lc \"echo ${q_parent}\"" 2>/dev/null) \
+    || die "Failed to expand RPI_WS_PARENT on master"
+unset q_ws q_parent
 
 WORKSPACE_LOCAL="${REPO_ROOT}/workspace"
-WORKSPACE_REMOTE="${RPI_WORKSPACE_DIR}"
-BUILD_REMOTE="${RPI_WORKSPACE_DIR}/build"
+WORKSPACE_REMOTE="${RPI_WORKSPACE_DIR_EXPANDED}"
+BUILD_REMOTE="${RPI_WORKSPACE_DIR_EXPANDED}/build"
 
 # ── Step 1: Sync workspace/ to master ────────────────────────────────────────
 if [[ $SKIP_SYNC -eq 0 ]]; then
@@ -70,12 +84,11 @@ if [[ $SKIP_SYNC -eq 0 ]]; then
         "${MASTER_USER}@${MASTER_IP}:${WORKSPACE_REMOTE}/"
     success "workspace/ synced to master"
 
-    # Also copy game files to the project folder on master
     info "Copying game files → master"
-    ssh "${MASTER_USER}@${MASTER_IP}" "mkdir -p ${RPI_WS_PARENT}"
-    scp "${REPO_ROOT}/rpi/game.cpp"    "${MASTER_USER}@${MASTER_IP}:${RPI_WS_PARENT}/game.cpp"
-    scp "${REPO_ROOT}/rpi/play_game.sh" "${MASTER_USER}@${MASTER_IP}:${RPI_WS_PARENT}/play_game.sh"
-    ssh "${MASTER_USER}@${MASTER_IP}" "chmod +x ${RPI_WS_PARENT}/play_game.sh"
+    ssh "${MASTER_USER}@${MASTER_IP}" "mkdir -p ${RPI_WS_PARENT_EXPANDED}"
+    scp "${REPO_ROOT}/rpi/game.cpp"     "${MASTER_USER}@${MASTER_IP}:${RPI_WS_PARENT_EXPANDED}/game.cpp"
+    scp "${REPO_ROOT}/rpi/play_game.sh" "${MASTER_USER}@${MASTER_IP}:${RPI_WS_PARENT_EXPANDED}/play_game.sh"
+    ssh "${MASTER_USER}@${MASTER_IP}" "chmod +x ${RPI_WS_PARENT_EXPANDED}/play_game.sh"
     success "game files copied"
 else
     warn "Skipping workspace sync (--skip-sync)"
@@ -85,28 +98,18 @@ fi
 if [[ $SKIP_COMPILE -eq 0 ]]; then
     step "Compiling on master"
 
-    # Ensure build dir exists
-    ssh "${MASTER_USER}@${MASTER_IP}" "mkdir -p ${BUILD_REMOTE}"
+    ssh "${MASTER_USER}@${MASTER_IP}" "mkdir -p ${BUILD_REMOTE} ${RPI_SHARED_BIN}"
 
-    # Compile game.cpp
     info "Compiling game.cpp → ${RPI_GAME_BIN:-/tmp/game}"
-    ssh "${MASTER_USER}@${MASTER_IP}" "mpic++ -O2 -std=c++17 -o ${RPI_GAME_BIN:-/tmp/game} ${RPI_WS_PARENT}/game.cpp"
+    ssh "${MASTER_USER}@${MASTER_IP}" "mpic++ -O2 -std=c++17 -o ${RPI_GAME_BIN:-/tmp/game} ${RPI_WS_PARENT_EXPANDED}/game.cpp"
     success "game binary compiled"
 
-    # Compile all 18 vision architecture binaries.
-    # NOTE: Binaries are ALWAYS compiled natively on the Pis.
-    # Docker binaries (even ARM64 emulated) are NOT transferred here —
-    # glibc versions and OpenMPI ABI may differ between Debian Bullseye
-    # in Docker and Raspberry Pi OS on the real hardware.
-    # Both environments use openmpi-bin/libopenmpi-dev for consistency.
     info "Compiling all vision architecture binaries (this takes a few minutes)..."
-    RPI_WS_EXPANDED=$(ssh "${MASTER_USER}@${MASTER_IP}" "echo ${RPI_WORKSPACE_DIR}")
-    ssh "${MASTER_USER}@${MASTER_IP}" WS="${RPI_WS_EXPANDED}" bash << 'REMOTE_COMPILE'
+    ssh "${MASTER_USER}@${MASTER_IP}" WS="${RPI_WORKSPACE_DIR_EXPANDED}" bash << 'REMOTE_COMPILE'
 set -e
 cd "$WS"
 B="${WS}/build"
 mkdir -p "$B"
-# Use the same flags as the Docker build
 FLAGS="-std=c++17 -O2 -I${WS}/vision/shared"
 
 echo "  [arch1] OpenMP Farm..."
@@ -141,6 +144,11 @@ mpic++ ${FLAGS} ${WS}/vision/shared/baselines.cpp                    -o ${B}/bas
 echo "  Done."
 REMOTE_COMPILE
     success "All 18 vision binaries compiled on master"
+
+    # Copy compiled binaries to the shared bin dir on master
+    info "Copying binaries to shared path ${RPI_SHARED_BIN} on master..."
+    ssh "${MASTER_USER}@${MASTER_IP}" "cp ${BUILD_REMOTE}/* ${RPI_SHARED_BIN}/"
+    success "Shared bin dir populated on master"
 else
     warn "Skipping compilation (--skip-compile)"
 fi
@@ -149,7 +157,6 @@ fi
 if [[ $SKIP_DIST -eq 0 ]]; then
     step "Distributing binaries to workers"
 
-    # List of all binaries to distribute
     BINARIES=(
         sobel_arch1 log_arch1 canny_arch1 fft_arch1
         sobel_arch2 log_arch2 canny_arch2 fft_arch2
@@ -163,17 +170,20 @@ if [[ $SKIP_DIST -eq 0 ]]; then
         WIP="${WORKER_IPS[$i]}"
         info "  → worker$((i+1)): ${WUSER}@${WIP}"
 
-        # Ensure remote build dir exists
-        ssh "${WUSER}@${WIP}" "mkdir -p ~/workspace/build"
+        # Create shared bin dir on worker (same absolute path for mpirun)
+        ssh "${WUSER}@${WIP}" "mkdir -p ${RPI_SHARED_BIN}"
 
-        # Also copy game binary and play script to workers
+        # Copy game binary and play script
         ssh "${MASTER_USER}@${MASTER_IP}" \
-            "scp /tmp/game ${WUSER}@${WIP}:/tmp/game && scp ~/play_game.sh ${WUSER}@${WIP}:~/play_game.sh && ssh ${WUSER}@${WIP} 'chmod +x ~/play_game.sh'"
+            "scp ${RPI_GAME_BIN:-/tmp/game} ${WUSER}@${WIP}:${RPI_GAME_BIN:-/tmp/game}"
+        ssh "${MASTER_USER}@${MASTER_IP}" \
+            "scp ${RPI_WS_PARENT_EXPANDED}/play_game.sh ${WUSER}@${WIP}:~/play_game.sh \
+             && ssh ${WUSER}@${WIP} 'chmod +x ~/play_game.sh'"
 
-        # Copy all vision binaries via master (master has passwordless SSH to workers)
+        # Distribute vision binaries to shared path on each worker
         for BIN in "${BINARIES[@]}"; do
             ssh "${MASTER_USER}@${MASTER_IP}" \
-                "scp ~/workspace/build/${BIN} ${WUSER}@${WIP}:~/workspace/build/${BIN}"
+                "scp ${BUILD_REMOTE}/${BIN} ${WUSER}@${WIP}:${RPI_SHARED_BIN}/${BIN}"
         done
 
         success "  worker$((i+1)) binaries deployed"
@@ -187,12 +197,12 @@ echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════╗"
 echo -e "║  Deploy complete                              ║"
 echo -e "╠══════════════════════════════════════════════╣"
-echo -e "║  Workspace : synced to master                ║"
-echo -e "║  Binaries  : 18 vision + 1 game              ║"
-echo -e "║  Nodes     : master + 5 workers              ║"
+echo -e "║  Workspace  : synced to master                ║"
+echo -e "║  Binaries   : 18 vision + 1 game              ║"
+echo -e "║  Shared bin : ${RPI_SHARED_BIN} (all nodes) ║"
+echo -e "║  Nodes      : master + 5 workers              ║"
 echo -e "╚══════════════════════════════════════════════╝${NC}"
 echo ""
 echo "Next steps:"
-echo "  Verify  : make rpi-verify"
-echo "  Play    : make rpi-game"
-echo "  Vision  : make rpi-run FILTER=sobel ARCH=3 NODES=6 IMAGE=path/to/img.jpg"
+echo "  Verify  : bash rpi/verify.sh"
+echo "  Analyse : bash analysis/run_analysis.sh --native"

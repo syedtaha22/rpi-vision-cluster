@@ -110,6 +110,10 @@ RPI_WORKSPACE_DIR=~/Desktop/rpi-vision-cluster/workspace
 
 # Where the game binary lives on all nodes
 RPI_GAME_BIN=/tmp/game
+
+# Fixed absolute path for mpirun binaries — must be identical on every node.
+# Each Pi has a unique username so ~/... paths differ; /var/tmp is uniform.
+RPI_SHARED_BIN=/var/tmp/pdc_build
 EOF
 
 success "Written: ${OUT}"

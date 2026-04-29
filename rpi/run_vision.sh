@@ -67,6 +67,12 @@ ALL_IPS=(  "$MASTER_IP"    "$WORKER1_IP"   "$WORKER2_IP"   "$WORKER3_IP"   "$WOR
 # Workspace path on the Pis — driven by config.env
 RPI_WORKSPACE_DIR="${RPI_WORKSPACE_DIR:-~/Desktop/rpi-vision-cluster/workspace}"
 
+# Expand on remote master explicitly so we don't rely on scp/ssh quirks.
+q_ws=$(printf '%q' "$RPI_WORKSPACE_DIR")
+RPI_WORKSPACE_DIR_EXPANDED=$(ssh "${MASTER_USER}@${MASTER_IP}" "bash -lc \"echo ${q_ws}\"" 2>/dev/null) \
+    || die "Failed to expand RPI_WORKSPACE_DIR on master"
+unset q_ws
+
 # Build the hostfile subset for requested node count
 HOSTFILE_SUBSET=""
 for i in $(seq 0 $((NODES - 1))); do
@@ -110,7 +116,7 @@ START_TIME=$(date +%s%N)
 
 ssh "${MASTER_USER}@${MASTER_IP}" \
     "mpirun -np ${NODES} --hostfile ${TEMP_HOSTFILE} \
-     ${RPI_WORKSPACE_DIR}/build/${BINARY} ${REMOTE_IMAGE} 2>&1"
+    ${RPI_WORKSPACE_DIR_EXPANDED}/build/${BINARY} ${REMOTE_IMAGE} 2>&1"
 
 END_TIME=$(date +%s%N)
 ELAPSED=$(( (END_TIME - START_TIME) / 1000000 ))
