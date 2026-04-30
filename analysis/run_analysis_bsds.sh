@@ -227,9 +227,13 @@ ensure_datasets() {
         local REMOTE_DS="$NATIVE_WS/vision/datasets"
         $EXEC_PREFIX mkdir -p "$REMOTE_DS" 2>/dev/null || true
         for ds in "${needed[@]}"; do
-            # For BSDS500, also re-sync if groundTruth_png is missing (images may exist but GT may not)
+            # Check if Pi already has enough images (and GT if BSDS500)
             local needs_sync=0
-            if ! $EXEC_PREFIX test -d "$REMOTE_DS/$ds" 2>/dev/null; then
+            local remote_count
+            remote_count=$($EXEC_PREFIX bash -c \
+                "find '$REMOTE_DS/$ds/images' -type f -name '*.jpg' -size +0c 2>/dev/null | wc -l" \
+                2>/dev/null || echo 0)
+            if [[ "$remote_count" -lt "$BSDS_N" ]]; then
                 needs_sync=1
             elif [[ "$ds" == "BSDS500" ]] && \
                  ! $EXEC_PREFIX test -d "$REMOTE_DS/$ds/groundTruth_png" 2>/dev/null; then
@@ -238,19 +242,56 @@ ensure_datasets() {
             fi
 
             if [[ $needs_sync -eq 1 ]]; then
-                log "  Dataset '$ds' missing on Pi — pushing from laptop..."
+                log "  Dataset '$ds' missing/incomplete on Pi — pushing ${BSDS_N} images + GT from laptop..."
                 if [[ -d "$LOCAL_DS/$ds" ]]; then
-                    rsync -az --info=progress2 \
-                        "$LOCAL_DS/$ds/" \
-                        "${MASTER_USER}@${MASTER_IP}:${REMOTE_DS}/${ds}/" \
-                        2>&1 | tee -a "$LOG_FILE"
-                    log "  ✓ '$ds' pushed to Pi"
+                    # Collect the first BSDS_N images locally (same sort order the script uses)
+                    local -a local_imgs=()
+                    while IFS= read -r f; do local_imgs+=("$f"); done < <(
+                        find "$LOCAL_DS/$ds/images" -type f -name '*.jpg' -size +0c 2>/dev/null \
+                            | sort | head -"$BSDS_N"
+                    )
+                    if [[ ${#local_imgs[@]} -eq 0 ]]; then
+                        log "  [WARN] '$ds' has no images locally — run Docker mode first: ./run_analysis_bsds.sh --fix"
+                    else
+                        # Push the selected image files
+                        local REMOTE_IMG_DIR="${REMOTE_DS}/${ds}/images"
+                        $EXEC_PREFIX mkdir -p "$REMOTE_IMG_DIR" 2>/dev/null || true
+                        rsync -az --info=progress2 \
+                            "${local_imgs[@]}" \
+                            "${MASTER_USER}@${MASTER_IP}:${REMOTE_IMG_DIR}/" \
+                            2>&1 | tee -a "$LOG_FILE"
+                        log "  ✓ ${#local_imgs[@]} images pushed to Pi"
+
+                        # Push the corresponding ground truth PNGs (same basenames, .png extension)
+                        local LOCAL_GT_DIR="$LOCAL_DS/$ds/groundTruth_png"
+                        if [[ -d "$LOCAL_GT_DIR" ]]; then
+                            local REMOTE_GT_DIR="${REMOTE_DS}/${ds}/groundTruth_png"
+                            $EXEC_PREFIX mkdir -p "$REMOTE_GT_DIR" 2>/dev/null || true
+                            local -a gt_files=()
+                            for img in "${local_imgs[@]}"; do
+                                local stem
+                                stem=$(basename "$img" | sed 's/\.[^.]*$//')
+                                local gt
+                                gt=$(find "$LOCAL_GT_DIR" -name "${stem}.png" 2>/dev/null | head -1)
+                                [[ -n "$gt" ]] && gt_files+=("$gt")
+                            done
+                            if [[ ${#gt_files[@]} -gt 0 ]]; then
+                                rsync -az --info=progress2 \
+                                    "${gt_files[@]}" \
+                                    "${MASTER_USER}@${MASTER_IP}:${REMOTE_GT_DIR}/" \
+                                    2>&1 | tee -a "$LOG_FILE"
+                                log "  ✓ ${#gt_files[@]} GT files pushed to Pi"
+                            else
+                                log "  [WARN] No GT files found locally for the selected images"
+                            fi
+                        fi
+                    fi
                 else
                     log "  [WARN] '$ds' also missing locally."
                     log "         Run Docker mode first to download: ./analysis/run_analysis_bsds.sh --fix"
                 fi
             else
-                log "  Dataset '$ds': already on Pi ✓"
+                log "  Dataset '$ds': already on Pi ✓ (${remote_count} images)"
             fi
         done
     else
@@ -355,7 +396,7 @@ runc() {
     log "  [RUN] $bin  nodes=$nodes  args=$args"
 
     local cmd="cd ${CONT_WS} && \
-        mpirun --allow-run-as-root -n ${nodes} --host ${hostlist} \
+        mpirun --allow-run-as-root --oversubscribe -n ${nodes} --host ${hostlist} \
         ${bin_path} ${args}"
 
     if [[ "${TIMEOUT_SECS:-0}" -gt 0 ]]; then
@@ -554,13 +595,18 @@ run_filter_bsds log "$BUILD/log_arch1" "$BUILD/log_arch2" \
 section "STEP 8: FFT — All Architectures (BSDS500)"
 while IFS= read -r img; do
     log "IMAGE: $img"
+    stem=$(basename "$img" | sed 's/\.[^.]*$//')
     for t in "${THREAD_COUNTS[@]}"; do
-        runc 1 "$BUILD/fft_arch1" "$img $t"
+        runc 1 "$BUILD/fft_arch1" \
+            "$img $t ${BSDS_OUT_CONT}/fft_arch1/fft_arch1_t${t}_${stem}.png"
     done
-    runc 1 "$BUILD/fft_arch2" "$img"
+    runc 1 "$BUILD/fft_arch2" \
+        "$img ${BSDS_OUT_CONT}/fft_arch2/fft_arch2_${stem}.png"
     for n in "${NODE_COUNTS[@]}"; do
-        runc "$n" "$BUILD/fft_arch3" "$img"
-        runc "$n" "$BUILD/fft_arch4" "$img"
+        runc "$n" "$BUILD/fft_arch3" \
+            "$img ${BSDS_OUT_CONT}/fft_arch3/fft_arch3_n${n}_${stem}.png"
+        runc "$n" "$BUILD/fft_arch4" \
+            "$img ${BSDS_OUT_CONT}/fft_arch4/fft_arch4_n${n}_${stem}.png"
     done
 done < "$BSDS_LIST_HOST"
 

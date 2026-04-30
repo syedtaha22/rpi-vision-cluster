@@ -687,7 +687,7 @@ def _fast_ssim(pred2d, gt2d):
         return None
 
 
-def compute_metrics_from_images(pred_path, gt_path):
+def compute_metrics_from_images(pred_path, gt_path, invert=False):
     if not HAS_PIL:
         return None
     try:
@@ -696,6 +696,8 @@ def compute_metrics_from_images(pred_path, gt_path):
         if pred_img.size != gt_img.size:
             gt_img = gt_img.resize(pred_img.size, PILImage.NEAREST)
         p2d = np.array(pred_img, dtype=np.uint8)
+        if invert:
+            p2d = 255 - p2d
         g2d = np.array(gt_img,   dtype=np.uint8)
         pbin = (p2d > 128).astype(np.int32).flatten()
         gbin = (g2d > 128).astype(np.int32).flatten()
@@ -717,20 +719,33 @@ def _resolve_gt_path(gt_dir, stem):
     """Find the GT file matching an image stem."""
     if not gt_dir:
         return None
-    # Try exact match then strip suffixes
-    for ext in [".png", ".jpg"]:
-        p = os.path.join(gt_dir, stem + ext)
-        if os.path.exists(p):
-            return p
-    # Stem might have extra tokens — try progressively shorter
-    parts = stem.split("_")
-    for n in range(len(parts), 0, -1):
-        candidate = "_".join(parts[-n:])
+    # Try exact match and _gt suffix variant
+    for candidate in [stem, stem + "_gt"]:
         for ext in [".png", ".jpg"]:
             p = os.path.join(gt_dir, candidate + ext)
             if os.path.exists(p):
                 return p
+    # Stem might have extra tokens — try progressively shorter
+    parts = stem.split("_")
+    for n in range(len(parts), 0, -1):
+        base = "_".join(parts[-n:])
+        for candidate in [base, base + "_gt"]:
+            for ext in [".png", ".jpg"]:
+                p = os.path.join(gt_dir, candidate + ext)
+                if os.path.exists(p):
+                    return p
     return None
+
+
+def _load_edge_img(path, tag):
+    """Load a reconstructed edge image as a uint8 numpy array.
+    LOG outputs are stored inverted (black edges, white background),
+    so invert pixel values to match the white-edges convention of other filters."""
+    img = PILImage.open(path).convert("L")
+    arr = np.array(img, dtype=np.uint8)
+    if tag.lower() == "log":
+        arr = 255 - arr
+    return arr
 
 
 def fig9_quality_metrics(recon_dir, gt_dir, outdir):
@@ -767,7 +782,8 @@ def fig9_quality_metrics(recon_dir, gt_dir, outdir):
             gt_path = _resolve_gt_path(gt_dir, stem)
             if gt_path is None:
                 continue
-            result = compute_metrics_from_images(pred_path, gt_path)
+            result = compute_metrics_from_images(pred_path, gt_path,
+                                                 invert=(flt_tag.lower() == "log"))
             if result is None:
                 continue
             jac, dice, ssim = result
@@ -833,6 +849,188 @@ def fig9_quality_metrics(recon_dir, gt_dir, outdir):
     print(f"  Saved: {path}")
 
 
+# ── Figures 9.1-x: Per-image visual GT matching ───────────────────────────────
+def fig9_visual_gt_match(recon_dir, gt_dir, orig_dir, outdir, max_images=6):
+    """
+    One figure per test image (fig9.1, fig9.2, …) showing:
+      Row 1: Original | GT | Sobel | Canny | LoG | FFT  (grayscale)
+      Row 2:   —      |  — | Sobel overlay | Canny overlay | LoG overlay | FFT overlay
+    Overlay: white=TP, red=FP, blue=FN, black=TN.
+    LOG images are displayed with inverted colours to match other filters.
+    """
+    if not HAS_PIL:
+        print("  [SKIP] Pillow not installed")
+        return
+    if not gt_dir or not os.path.isdir(gt_dir):
+        print(f"  [SKIP] GT dir not found ({gt_dir})")
+        return
+    if not os.path.isdir(recon_dir):
+        print(f"  [SKIP] recon_dir not found: {recon_dir}")
+        return
+
+    FILTER_TAGS    = ["sobel", "canny", "log", "fft"]
+    FILTER_DISPLAY = ["Sobel", "Canny", "LoG", "FFT"]
+    ARCH_PRIORITY  = [3, 1, 2, 4]
+
+    # Build best-arch lookup: tag → {stem: path}
+    best = {tag: {} for tag in FILTER_TAGS}
+    for sub in sorted(os.listdir(recon_dir)):
+        sub_path = os.path.join(recon_dir, sub)
+        if not os.path.isdir(sub_path):
+            continue
+        m = re.match(r"(\w+)_arch(\d)", sub)
+        if not m:
+            continue
+        tag      = m.group(1).lower()
+        arch_num = int(m.group(2))
+        if tag not in best:
+            continue
+        for fn in sorted(os.listdir(sub_path)):
+            if not fn.endswith(".png"):
+                continue
+            stem = re.sub(r"^[a-z]+_arch\d[^_]*_", "", fn.replace(".png", ""))
+            existing = best[tag].get(stem)
+            if existing is None:
+                best[tag][stem] = os.path.join(sub_path, fn)
+            else:
+                ex_arch = int(re.search(r"arch(\d)",
+                              os.path.basename(os.path.dirname(existing))).group(1))
+                if ARCH_PRIORITY.index(arch_num) < ARCH_PRIORITY.index(ex_arch):
+                    best[tag][stem] = os.path.join(sub_path, fn)
+
+    # Collect stems that have at least one filter result AND a GT file
+    all_stems = set()
+    for tag in FILTER_TAGS:
+        all_stems.update(best[tag].keys())
+    stems_with_gt = [s for s in sorted(all_stems)
+                     if _resolve_gt_path(gt_dir, s) is not None]
+    stems = stems_with_gt[:max_images]
+
+    if not stems:
+        print("  [SKIP] No stems with matching GT found")
+        return
+
+    # Build original lookup
+    orig_lookup = {}
+    if orig_dir and os.path.isdir(orig_dir):
+        for fn in os.listdir(orig_dir):
+            orig_lookup[os.path.splitext(fn)[0]] = os.path.join(orig_dir, fn)
+
+    has_orig = any(s in orig_lookup for s in stems)
+
+    # Column layout: [Original?] + GT + 4 filters
+    img_cols   = (["Original"] if has_orig else []) + ["GT"] + FILTER_DISPLAY
+    n_img_cols = len(img_cols)
+    # overlay row has blanks for Original + GT, then one per filter
+    n_blank    = 1 + (1 if has_orig else 0)  # Original (optional) + GT
+
+    for fig_idx, stem in enumerate(stems, start=1):
+        gt_path = _resolve_gt_path(gt_dir, stem)
+        try:
+            gt_arr = np.array(PILImage.open(gt_path).convert("L"), dtype=np.uint8)
+        except Exception:
+            continue
+        gt_bin = (gt_arr > 128)
+
+        fig, axes = plt.subplots(2, n_img_cols,
+                                 figsize=(2.6 * n_img_cols, 5.5),
+                                 squeeze=False)
+        fig.suptitle(f"Fig 9.{fig_idx}  |  Image: {stem}  —  Filter vs Ground Truth",
+                     fontsize=10, fontweight="bold")
+
+        col = 0
+
+        # ── Original (row 0 only) ─────────────────────────────────────────────
+        if has_orig:
+            ax = axes[0][col]
+            opath = orig_lookup.get(stem)
+            if opath and os.path.exists(opath):
+                try:
+                    axes[0][col].imshow(
+                        np.array(PILImage.open(opath).convert("L"), dtype=np.uint8),
+                        cmap="gray", interpolation="lanczos")
+                except Exception:
+                    axes[0][col].text(0.5, 0.5, "err", ha="center", va="center",
+                                      transform=axes[0][col].transAxes, fontsize=8)
+            else:
+                axes[0][col].text(0.5, 0.5, "N/A", ha="center", va="center",
+                                  transform=axes[0][col].transAxes, fontsize=9,
+                                  color="gray")
+            axes[0][col].set_title("Original", fontsize=8, fontweight="bold")
+            axes[0][col].axis("off")
+            axes[1][col].axis("off")   # blank in overlay row
+            col += 1
+
+        # ── GT (row 0 only) ───────────────────────────────────────────────────
+        axes[0][col].imshow(gt_arr, cmap="gray", interpolation="lanczos")
+        axes[0][col].set_title("Ground Truth", fontsize=8, fontweight="bold")
+        axes[0][col].axis("off")
+        axes[1][col].axis("off")   # blank in overlay row
+        col += 1
+
+        # ── Per-filter columns ────────────────────────────────────────────────
+        for tag, disp in zip(FILTER_TAGS, FILTER_DISPLAY):
+            fpath = best[tag].get(stem)
+            ax_img = axes[0][col]
+            ax_ov  = axes[1][col]
+
+            if fpath and os.path.exists(fpath):
+                try:
+                    pred_arr = _load_edge_img(fpath, tag)
+                    pred_bin = (pred_arr > 128)
+
+                    # Grayscale row
+                    ax_img.imshow(pred_arr, cmap="gray", interpolation="lanczos")
+
+                    # Colour overlay: white=TP, red=FP, blue=FN, black=TN
+                    h, w = gt_bin.shape
+                    overlay = np.zeros((h, w, 3), dtype=np.uint8)
+                    tp_mask = pred_bin & gt_bin
+                    fp_mask = pred_bin & ~gt_bin
+                    fn_mask = ~pred_bin & gt_bin
+                    overlay[tp_mask] = [255, 255, 255]   # white
+                    overlay[fp_mask] = [220,  50,  50]   # red
+                    overlay[fn_mask] = [ 50,  80, 220]   # blue
+                    ax_ov.imshow(overlay, interpolation="lanczos")
+
+                    # Metric caption
+                    tp = int(np.sum(tp_mask))
+                    fp = int(np.sum(fp_mask))
+                    fn = int(np.sum(fn_mask))
+                    jac  = tp / (tp + fp + fn + 1e-8)
+                    dice = 2 * tp / (2 * tp + fp + fn + 1e-8)
+                    ssim_val = _fast_ssim(pred_arr.astype(np.float64),
+                                         gt_arr.astype(np.float64)) or 0.0
+                    ax_ov.set_xlabel(f"J={jac:.2f}  D={dice:.2f}  S={ssim_val:.2f}",
+                                     fontsize=7)
+                except Exception:
+                    ax_img.text(0.5, 0.5, "err", ha="center", va="center",
+                                transform=ax_img.transAxes, fontsize=8)
+                    ax_ov.text(0.5, 0.5, "err", ha="center", va="center",
+                               transform=ax_ov.transAxes, fontsize=8)
+            else:
+                ax_img.text(0.5, 0.5, "—", ha="center", va="center",
+                            transform=ax_img.transAxes, fontsize=14, color="#aaa")
+                ax_ov.text(0.5, 0.5, "—", ha="center", va="center",
+                           transform=ax_ov.transAxes, fontsize=14, color="#aaa")
+
+            ax_img.set_title(disp, fontsize=8, fontweight="bold")
+            ax_img.axis("off")
+            ax_ov.axis("off")
+            col += 1
+
+        # Row labels
+        axes[0][0].set_ylabel("Images", fontsize=8, rotation=90, labelpad=4)
+        axes[1][n_blank].set_ylabel("Overlay\n(W=TP R=FP B=FN)",
+                                    fontsize=7, rotation=90, labelpad=4)
+
+        plt.tight_layout()
+        out_path = os.path.join(outdir, f"fig9.{fig_idx}_visual_gt_match.png")
+        plt.savefig(out_path, dpi=130, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved: {out_path}")
+
+
 # ── Figure 10: Reconstructed image grid per filter ────────────────────────────
 def fig10_recon_per_filter(recon_dir, outdir, max_cols=5):
     """
@@ -847,6 +1045,10 @@ def fig10_recon_per_filter(recon_dir, outdir, max_cols=5):
         print(f"  [SKIP] recon_dir not found: {recon_dir}")
         return
 
+    # Map lowercase dir prefix → FILTERS display name
+    _TAG_TO_FILTER = {"sobel": "Sobel", "canny": "Canny",
+                      "log": "LoG", "fft": "FFT"}
+
     # Load all images grouped by (filter, arch, stem)
     grid_data = {}  # (flt_tag, arch_num) → {stem: path}
     for sub in sorted(os.listdir(recon_dir)):
@@ -856,7 +1058,8 @@ def fig10_recon_per_filter(recon_dir, outdir, max_cols=5):
         m = re.match(r"(\w+)_arch(\d)", sub)
         if not m:
             continue
-        flt_tag  = m.group(1).capitalize()
+        raw_tag  = m.group(1).lower()
+        flt_tag  = _TAG_TO_FILTER.get(raw_tag, raw_tag.capitalize())
         arch_num = int(m.group(2))
         key = (flt_tag, arch_num)
         grid_data.setdefault(key, {})
@@ -901,8 +1104,8 @@ def fig10_recon_per_filter(recon_dir, outdir, max_cols=5):
                 fpath = arch_dict.get(stem)
                 if fpath and os.path.exists(fpath):
                     try:
-                        img = PILImage.open(fpath).convert("L")
-                        ax.imshow(np.array(img), cmap="gray", interpolation="lanczos")
+                        arr = _load_edge_img(fpath, flt)
+                        ax.imshow(arr, cmap="gray", interpolation="lanczos")
                     except Exception as e:
                         ax.text(0.5, 0.5, str(e)[:20], ha="center", va="center",
                                 transform=ax.transAxes, fontsize=6)
@@ -1176,8 +1379,8 @@ def fig10b_recon_per_image(recon_dir, orig_dir, outdir, max_images=6):
             fpath = best[tag].get(stem)
             if fpath and os.path.exists(fpath):
                 try:
-                    img = PILImage.open(fpath).convert("L")
-                    ax.imshow(np.array(img), cmap="gray", interpolation="lanczos")
+                    arr = _load_edge_img(fpath, tag)
+                    ax.imshow(arr, cmap="gray", interpolation="lanczos")
                 except Exception:
                     ax.text(0.5, 0.5, "err", ha="center", va="center",
                             transform=ax.transAxes, fontsize=8)
@@ -1354,9 +1557,9 @@ def main():
     parser.add_argument("--log",           default=os.path.join(SCRIPT_DIR, "report_bsds/analysis_bsds.log"))
     parser.add_argument("--outdir",        default=os.path.join(SCRIPT_DIR, "report_bsds"))
     parser.add_argument("--recon-dir",     default=os.path.join(SCRIPT_DIR, "report_bsds/reconstructed"))
-    parser.add_argument("--orig-dir",      default="",
+    parser.add_argument("--orig-dir",      default=os.path.join(SCRIPT_DIR, "report_bsds/originals"),
                         help="Directory of original BSDS test images for side-by-side comparison")
-    parser.add_argument("--gt-dir",        default="")
+    parser.add_argument("--gt-dir",        default=os.path.join(SCRIPT_DIR, "../workspace/results/gt/groundTruth_png"))
     parser.add_argument("--node-counts",   default="2 4 6")
     parser.add_argument("--thread-counts", default="1 2 4")
     args = parser.parse_args()
@@ -1396,6 +1599,9 @@ def main():
 
     print("\nGenerating quality metrics …")
     fig9_quality_metrics(args.recon_dir, gt_dir, args.outdir)
+
+    print("\nGenerating per-image visual GT comparison …")
+    fig9_visual_gt_match(args.recon_dir, gt_dir, orig_dir, args.outdir)
 
     print("\nGenerating reconstructed image grids …")
     fig10_recon_per_filter(args.recon_dir, args.outdir)

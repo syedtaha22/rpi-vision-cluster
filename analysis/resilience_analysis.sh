@@ -325,7 +325,7 @@ runc() {
     log "  [RUN] $bin  nodes=$nodes  args=$args"
 
     local cmd="cd ${CONT_WS} && \
-        mpirun --allow-run-as-root -n ${nodes} --host ${hostlist} \
+        mpirun --allow-run-as-root --oversubscribe -n ${nodes} --host ${hostlist} \
         ${bin_path} ${args}"
 
     if [[ "${TIMEOUT_SECS:-0}" -gt 0 ]]; then

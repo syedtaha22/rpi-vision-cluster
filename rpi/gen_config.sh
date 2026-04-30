@@ -105,8 +105,8 @@ WORKER5_IP=${RESOLVED[rpi-worker5]}
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # Workspace location on every Pi node (Desktop/rpi-vision-cluster/workspace)
-RPI_WS_PARENT=~/Desktop/rpi-vision-cluster
-RPI_WORKSPACE_DIR=~/Desktop/rpi-vision-cluster/workspace
+RPI_WS_PARENT=/home/${MASTER_USER}/Desktop/rpi-vision-cluster
+RPI_WORKSPACE_DIR=/home/${MASTER_USER}/Desktop/rpi-vision-cluster/workspace
 
 # Where the game binary lives on all nodes
 RPI_GAME_BIN=/tmp/game

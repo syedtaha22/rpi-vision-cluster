@@ -163,7 +163,7 @@ runc() {
     log "  [RUN] $bin  nodes=$nodes  args=$args"
 
     local cmd="cd ${CONT_WS} && \
-        mpirun --allow-run-as-root -n ${nodes} --host ${hostlist} \
+        mpirun --allow-run-as-root --oversubscribe -n ${nodes} --host ${hostlist} \
         ${bin_path} ${args}"
 
     if [[ "${TIMEOUT_SECS:-0}" -gt 0 ]]; then
@@ -203,14 +203,29 @@ ensure_datasets() {
         local REMOTE_DS="$NATIVE_WS/vision/datasets"
         $EXEC_PREFIX mkdir -p "$REMOTE_DS" 2>/dev/null || true
         for ds in "${needed[@]}"; do
-            if ! $EXEC_PREFIX test -d "$REMOTE_DS/$ds" 2>/dev/null; then
-                log "  Dataset '$ds' missing on Pi — pushing from laptop..."
+            # Check if Pi already has at least one usable image for this dataset
+            local remote_img
+            remote_img=$($EXEC_PREFIX bash -c \
+                "find '$REMOTE_DS/$ds' -type f \( -name '*.jpg' -o -name '*.png' -o -name '*.JPEG' \) -size +0c 2>/dev/null | head -1" \
+                2>/dev/null || true)
+            if [[ -z "$remote_img" ]]; then
+                log "  Dataset '$ds' missing on Pi — pushing one image from laptop..."
                 if [[ -d "$LOCAL_DS/$ds" ]]; then
-                    rsync -az --info=progress2 \
-                        "$LOCAL_DS/$ds/" \
-                        "${MASTER_USER}@${MASTER_IP}:${REMOTE_DS}/${ds}/" \
-                        2>&1 | tee -a "$LOG_FILE"
-                    log "  ✓ '$ds' pushed to Pi"
+                    local local_img
+                    local_img=$(find "$LOCAL_DS/$ds" -type f \( -name '*.jpg' -o -name '*.png' -o -name '*.JPEG' \) -size +0c 2>/dev/null | head -1)
+                    if [[ -n "$local_img" ]]; then
+                        local rel_dir
+                        rel_dir=$(dirname "${local_img#$LOCAL_DS/$ds/}")
+                        $EXEC_PREFIX mkdir -p "$REMOTE_DS/$ds/$rel_dir" 2>/dev/null || true
+                        ssh "${MASTER_USER}@${MASTER_IP}" "mkdir -p '$REMOTE_DS/$ds/$rel_dir'"
+                        rsync -az --info=progress2 \
+                            "$local_img" \
+                            "${MASTER_USER}@${MASTER_IP}:${REMOTE_DS}/${ds}/${rel_dir}/" \
+                            2>&1 | tee -a "$LOG_FILE"
+                        log "  ✓ '$ds' image pushed to Pi"
+                    else
+                        log "  [WARN] '$ds' has no images locally — run Docker mode first: ./analysis/run_analysis.sh --fix"
+                    fi
                 else
                     log "  [WARN] '$ds' also missing locally."
                     log "         Run Docker mode first to download: ./analysis/run_analysis.sh --fix"
@@ -386,7 +401,7 @@ else
     ensure_datasets "${NEEDED_DS[@]}" || die "Dataset provisioning failed"
 
     CIFAR_IMG=$($EXEC_PREFIX bash -c "find '${DS_ROOT}/cifar-10' -type f \\\( -name '*.jpg' -o -name '*.png' \\\) -size +0c 2>/dev/null | head -1" 2>/dev/null || true)
-    TINY_IMG=$($EXEC_PREFIX bash -c "find '${DS_ROOT}/tiny-imagenet-200' -type f \\\( -name '*.jpg' -o -name '*.JPEG' \\\) -size +0c 2>/dev/null | head -1" 2>/dev/null || true)
+    TINY_IMG=$($EXEC_PREFIX bash -c "find '${DS_ROOT}/tiny-imagenet-200' -type f \\\( -name '*.jpg' -o -name '*.JPEG' -o -name '*.png' \\\) -size +0c 2>/dev/null | head -1" 2>/dev/null || true)
     COCO_IMG=$($EXEC_PREFIX bash -c "find '${DS_ROOT}/coco-val2017' -type f -name '*.jpg' -size +0c 2>/dev/null | head -1" 2>/dev/null || true)
 
     for img in "$CIFAR_IMG" "$TINY_IMG" "$COCO_IMG"; do
