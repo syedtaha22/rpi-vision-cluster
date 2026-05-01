@@ -4,17 +4,17 @@ A distributed image processing system built on a Raspberry Pi cluster using MPI 
 
 ## Project Structure
 
-```
+```sh
 rpi-vision-cluster/
-├── README.md                 # This file
-├── hostlists                 # MPI hostlist configuration
+├── README.md                # This file
+├── hostlists                # MPI hostlist configuration
 │
-├── examples/                 # Example MPI programs
-│   ├── hello_cluster.c       # Basic MPI test
-│   ├── matrix_multiply.c     # Matrix multiplication with profiling
-│   └── mpi_latency_test.c    # Communication benchmark
+├── examples/                # Example MPI programs
+│   ├── hello_cluster.c      # Basic MPI test
+│   ├── matrix_multiply.c    # Matrix multiplication with profiling
+│   └── mpi_latency_test.c   # Communication benchmark
 │
-└── scripts/                  # Cluster management utilities
+└── scripts/                 # Cluster management utilities
     ├── globals.sh           # Shared configuration
     ├── init.sh              # Initialize entire cluster
     ├── init_pi.sh           # Per-node setup (auto-detects master vs worker)
