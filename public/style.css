@@ -1,0 +1,182 @@
+/**
+ * CSS Variables (Design Tokens)
+ * Dark theme with orange accent for Real-Time Sobel Edge Detection UI.
+ */
+:root {
+    /** Background color for page and panes. */
+    --bg: #0e1219;
+    
+    /** Card/panel background color. */
+    --card: #111318;
+    
+    /** Primary text color. */
+    --ink: #e6eef6;
+    
+    /** Accent color for buttons and highlights. */
+    --accent: #c75b12;
+    
+    /** Border color for cards and elements. */
+    --border: #22252a;
+}
+
+/* Apply border-box sizing model globally. */
+* {
+    box-sizing: border-box;
+}
+
+/* Force [hidden] attribute to always hide elements. */
+[hidden] {
+    display: none !important;
+}
+
+/* Root body styles: full viewport height, dark theme, sans-serif font. */
+body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+}
+
+/* Main application container: centered layout with max width, flex column. */
+.app {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    min-height: calc(100vh - 2rem);
+}
+
+/* Header bar: title on left, controls on right. */
+.topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 1rem;
+}
+
+/* Control button group: responsive, right-aligned. */
+.controls {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+/* Main heading: responsive font size via clamp(). */
+h1 {
+    margin: 0;
+    font-size: clamp(1.25rem, 2.2vw, 2rem);
+    letter-spacing: 0.02em;
+}
+
+/* Button styling: orange accent, white text, bold, interactive. */
+button {
+    border: 1px solid var(--ink);
+    background: var(--accent);
+    color: #fff;
+    font-weight: 700;
+    font-size: 1rem;
+    padding: 0.6rem 1rem;
+    cursor: pointer;
+}
+
+/* Button hover: subtle brightness increase. */
+button:hover {
+    filter: brightness(1.05);
+}
+
+/**
+ * Panes container: dual-column grid layout (Raw Feed | Processed Feed).
+ * Grows to fill remaining vertical space after header.
+ */
+.panes {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    align-items: center;
+    flex: 1 1 auto;
+    min-height: 75vh;
+}
+
+/**
+ * Individual pane: card styling, centered flex layout for heading + media.
+ * Vertically centers content within grid cell.
+ */
+.pane {
+    background: var(--card);
+    border: 1px solid var(--border);
+    padding: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    align-self: center;
+    max-height: 80vh;
+}
+
+/* Pane heading. */
+.pane h2 {
+    margin: 0 0 0.5rem;
+    font-size: 1rem;
+}
+
+/* Raw video and processed canvas: 4:3 aspect ratio, responsive width, bordered. */
+video,
+#processedCanvas {
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    border: 1px solid var(--border);
+    background: #111;
+    display: block;
+    max-height: 70vh;
+}
+
+/**
+ * Layout adjustments when raw feed is hidden (via .raw-hidden body class).
+ * Switches from dual-column grid to centered flex layout with processed feed only.
+ */
+
+/* Hide raw pane entirely. */
+.raw-hidden .pane--raw {
+    display: none;
+}
+
+/* Center and size processed pane for single-column view. */
+.raw-hidden .panes {
+    display: flex;
+    justify-content: center;
+}
+
+/* Processed pane: constrain width, adjust spacing for centered layout. */
+.raw-hidden .pane--processed {
+    width: min(100%, 960px);
+    padding: 0.5rem;
+    gap: 0.25rem;
+    justify-content: flex-start;
+}
+
+/* Increase max-height for processed canvas in single-column view. */
+.raw-hidden #processedCanvas {
+    max-height: 78vh;
+}
+
+/* Reduce margin on processed pane heading. */
+.raw-hidden .pane--processed h2 {
+    margin-bottom: 0.25rem;
+}
+
+/* Mobile and tablet responsive behavior: stack panes vertically. */
+@media (max-width: 780px) {
+    .panes {
+        grid-template-columns: 1fr;
+    }
+
+    .raw-hidden .panes {
+        display: flex;
+    }
+}
