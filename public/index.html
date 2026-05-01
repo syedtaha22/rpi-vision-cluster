@@ -1,59 +1,28 @@
 <!DOCTYPE html>
-<!--
-  Real-Time Sobel Edge Detection Viewer
-  
-  This page provides a dual-pane interface for:
-  1. Raw camera feed (MediaDevices camera capture, 640x480)
-  2. Processed feed (Sobel edge-detected frames from server via WebSocket)
-  
-  Controls:
-  - Start/Stop: Begin/end camera capture and WebSocket transmission
-  - Hide Raw Feed: Toggle between dual-pane and processed-only centered views
-  
-  Frame flow:
-  1. JavaScript captures raw frames from <video> element to offscreen <canvas>
-  2. Raw RGBA frame data sent to server via WebSocket binary frames
-  3. Server applies Sobel edge detection, returns processed RGBA frame
-  4. Processed frame rendered to visible <canvas> element
--->
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Real-Time Sobel Edge Detection</title>
-  <!-- Stylesheet with dark theme, responsive layout, and pane controls -->
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <!-- Main application container -->
   <main class="app">
-    <!-- Header: title and control buttons -->
     <header class="topbar">
       <h1>Real-Time Sobel Edge Detection</h1>
-      <!-- Control buttons: visibility toggle and start/stop -->
       <div class="controls">
-        <!-- Toggle button: switches between dual-pane and centered processed-only views -->
-     !-- Dual-pane display: raw video (left) and processed canvas (right) -->
+        <button id="rawToggleBtn" type="button">Hide Raw Feed</button>
+        <button id="toggleBtn" type="button">Start</button>
+      </div>
+    </header>
+
     <section class="panes">
-      <!-- Raw Camera Feed Pane: shows unprocessed stream from getUserMedia() -->
       <article class="pane pane--raw">
         <h2>Raw Camera Feed</h2>
-        <!-- Video element receives MediaStream from getUserMedia(); autoplay, muted, playsinline for mobile -->
         <video id="rawVideo" autoplay muted playsinline></video>
       </article>
-      <!-- Processed Feed Pane: displays Sobel edge-detected frames from server -->
       <article class="pane pane--processed">
         <h2>Processed Feed (Server)</h2>
-        <!-- Canvas rendering target for received processed frames (640x480, RGBA) -->
-        <canvas id="processedCanvas" width="640" height="480"></canvas>
-      </article>
-    </section>
-  </main>
-
-  <!-- Offscreen capture canvas: used by script.js to extract frame data from video element -->
-  <canvas id="captureCanvas" width="640" height="480" hidden></canvas>
-  
-  <!-- Client-side application logic: frame capture, WebSocket transmission, rendering --
         <canvas id="processedCanvas" width="640" height="480"></canvas>
       </article>
     </section>
