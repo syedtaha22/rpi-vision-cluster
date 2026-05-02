@@ -92,8 +92,8 @@ if [[ $NATIVE -eq 1 ]]; then
 fi
 
 if [[ $NATIVE -eq 1 ]]; then
-    LOG_FILE="$SCRIPT_DIR/analysis_rpi_results.log"
     REPORT_DIR="$SCRIPT_DIR/report_rpi"
+    LOG_FILE="$REPORT_DIR/analysis_rpi_results.log"
 fi
 
 mkdir -p "$REPORT_DIR" "$WS/results/out"
