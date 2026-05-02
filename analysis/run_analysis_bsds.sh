@@ -266,13 +266,14 @@ ensure_datasets() {
             # Check if Pi already has enough images (and GT if BSDS500)
             local needs_sync=0
             local remote_count
-            remote_count=$($EXEC_PREFIX bash -c \
-                "find '$REMOTE_DS/$ds/images' -type f -name '*.jpg' -size +0c 2>/dev/null | wc -l" \
+            remote_count=$(ssh -o BatchMode=yes "${MASTER_USER}@${MASTER_HOST}" \
+                "find '${REMOTE_DS}/${ds}/images' -type f -name '*.jpg' -size +0c 2>/dev/null | wc -l" \
                 2>/dev/null || echo 0)
             if [[ "$remote_count" -lt "$BSDS_N" ]]; then
                 needs_sync=1
             elif [[ "$ds" == "BSDS500" ]] && \
-                 ! $EXEC_PREFIX test -d "$REMOTE_DS/$ds/groundTruth_png" 2>/dev/null; then
+                 ! ssh -o BatchMode=yes "${MASTER_USER}@${MASTER_HOST}" \
+                   "test -d '${REMOTE_DS}/${ds}/groundTruth_png'" 2>/dev/null; then
                 log "  Dataset '$ds' on Pi is missing groundTruth_png — re-syncing..."
                 needs_sync=1
             fi
@@ -308,7 +309,7 @@ ensure_datasets() {
                                 local stem
                                 stem=$(basename "$img" | sed 's/\.[^.]*$//')
                                 local gt
-                                gt=$(find "$LOCAL_GT_DIR" -name "${stem}.png" 2>/dev/null | head -1)
+                                gt=$(find "$LOCAL_GT_DIR" \( -name "${stem}.png" -o -name "${stem}_gt.png" \) 2>/dev/null | head -1)
                                 [[ -n "$gt" ]] && gt_files+=("$gt")
                             done
                             if [[ ${#gt_files[@]} -gt 0 ]]; then
