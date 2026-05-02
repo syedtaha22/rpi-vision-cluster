@@ -54,23 +54,23 @@ echo -e "${BOLD}═════════════════════�
 echo ""
 echo -e "${BOLD}[1/4] SSH Connectivity${NC}"
 for i in $(seq 0 5); do
-    USER="${USERS[$i]}"; IP="${IPS[$i]}"; LABEL="${LABELS[$i]}"
-    if ssh -o ConnectTimeout=5 -o BatchMode=yes "${USER}@${IP}" "hostname" &>/dev/null; then
-        HOSTNAME=$(ssh -o ConnectTimeout=5 "${USER}@${IP}" "hostname" 2>/dev/null)
-        echo -e "  ${PASS} ${LABEL} (${USER}@${IP}) — hostname: ${HOSTNAME}"
+    USER="${USERS[$i]}"; HOST="${HOSTS[$i]}"; LABEL="${LABELS[$i]}"
+    if ssh -o ConnectTimeout=5 -o BatchMode=yes "${USER}@${HOST}" "hostname" &>/dev/null; then
+        RHOST=$(ssh -o ConnectTimeout=5 "${USER}@${HOST}" "hostname" 2>/dev/null)
+        echo -e "  ${PASS} ${LABEL} (${USER}@${HOST}) — hostname: ${RHOST}"
     else
-        echo -e "  ${FAIL} ${LABEL} (${USER}@${IP}) — UNREACHABLE"
+        echo -e "  ${FAIL} ${LABEL} (${USER}@${HOST}) — UNREACHABLE"
         OVERALL=1
     fi
 done
 
 # ── Check 2: mpich installed ──────────────────────────────────────────────────
 echo ""
-echo -e "${BOLD}[2/4] mpich Installation${NC}"
+echo -e "${BOLD}[2/4] MPI Installation${NC}"
 for i in $(seq 0 5); do
-    USER="${USERS[$i]}"; IP="${IPS[$i]}"; LABEL="${LABELS[$i]}"
-    if ssh -o ConnectTimeout=5 -o BatchMode=yes "${USER}@${IP}" "which mpirun" &>/dev/null; then
-        VER=$(ssh "${USER}@${IP}" "mpirun --version 2>&1 | head -1" 2>/dev/null || echo "unknown")
+    USER="${USERS[$i]}"; HOST="${HOSTS[$i]}"; LABEL="${LABELS[$i]}"
+    if ssh -o ConnectTimeout=5 -o BatchMode=yes "${USER}@${HOST}" "which mpirun" &>/dev/null; then
+        VER=$(ssh "${USER}@${HOST}" "mpirun --version 2>&1 | head -1" 2>/dev/null || echo "unknown")
         echo -e "  ${PASS} ${LABEL} — ${VER}"
     else
         echo -e "  ${FAIL} ${LABEL} — mpirun not found (run setup_cluster.sh)"
@@ -84,34 +84,34 @@ if [[ $QUICK -eq 1 ]]; then
 else
     # ── Check 3: Binaries present ─────────────────────────────────────────────
     echo ""
-    echo -e "${BOLD}[3/4] Vision Binaries (~/workspace/build/)${NC}"
+    echo -e "${BOLD}[3/4] Vision Binaries (${RPI_SHARED_BIN}/)${NC}"
     for i in $(seq 0 5); do
-        USER="${USERS[$i]}"; IP="${IPS[$i]}"; LABEL="${LABELS[$i]}"
+        USER="${USERS[$i]}"; HOST="${HOSTS[$i]}"; LABEL="${LABELS[$i]}"
         MISSING_COUNT=0
         MISSING_LIST=()
         for BIN in "${EXPECTED_BINS[@]}"; do
-            if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "${USER}@${IP}" \
-                "[ -f ~/workspace/build/${BIN} ]" &>/dev/null; then
+            if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "${USER}@${HOST}" \
+                "[ -s ${RPI_SHARED_BIN}/${BIN} ] && [ -x ${RPI_SHARED_BIN}/${BIN} ]" &>/dev/null; then
                 MISSING_COUNT=$((MISSING_COUNT + 1))
                 MISSING_LIST+=("$BIN")
             fi
         done
 
-        # Check game binary
+        # Check game binary (non-fatal — not required for vision analysis)
         GAME_OK=1
-        if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "${USER}@${IP}" \
+        if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "${USER}@${HOST}" \
             "[ -f /tmp/game ]" &>/dev/null; then
             GAME_OK=0
-            MISSING_COUNT=$((MISSING_COUNT + 1))
-            MISSING_LIST+=("/tmp/game")
         fi
 
-        TOTAL=$((${#EXPECTED_BINS[@]} + 1))
+        TOTAL=${#EXPECTED_BINS[@]}
         FOUND=$((TOTAL - MISSING_COUNT))
         if [[ $MISSING_COUNT -eq 0 ]]; then
-            echo -e "  ${PASS} ${LABEL} — all ${TOTAL} binaries present"
+            GAME_MSG=""
+            [[ $GAME_OK -eq 0 ]] && GAME_MSG=" (game binary missing — run rpi-deploy to fix)"
+            echo -e "  ${PASS} ${LABEL} — all ${TOTAL} vision binaries present${GAME_MSG}"
         else
-            echo -e "  ${FAIL} ${LABEL} — ${FOUND}/${TOTAL} binaries (missing: ${MISSING_LIST[*]})"
+            echo -e "  ${FAIL} ${LABEL} — ${FOUND}/${TOTAL} vision binaries (missing: ${MISSING_LIST[*]})"
             echo -e "         → Run: make rpi-deploy"
             OVERALL=1
         fi
@@ -120,11 +120,11 @@ else
     # ── Check 4: MPI connectivity test ────────────────────────────────────────
     echo ""
     echo -e "${BOLD}[4/4] MPI Cross-Node Launch (mpirun -np 6 hostname)${NC}"
-    if ssh -o BatchMode=yes "${MASTER_USER}@${MASTER_IP}" \
-        "mpirun -np 6 --hostfile ~/hostfile hostname" 2>/tmp/mpi_verify_err; then
+    if ssh -o BatchMode=yes "${MASTER_USER}@${MASTER_HOST}" \
+        "mpirun -np 6 --hostfile /rpi-vision-cluster/hostlists hostname" 2>/tmp/mpi_verify_err; then
         echo -e "  ${PASS} MPI launched successfully across all 6 nodes"
-        ssh "${MASTER_USER}@${MASTER_IP}" \
-            "mpirun -np 6 --hostfile ~/hostfile hostname 2>/dev/null" | \
+        ssh "${MASTER_USER}@${MASTER_HOST}" \
+            "mpirun -np 6 --hostfile /rpi-vision-cluster/hostlists hostname 2>/dev/null" | \
             sed 's/^/         /'
     else
         echo -e "  ${FAIL} MPI launch failed"

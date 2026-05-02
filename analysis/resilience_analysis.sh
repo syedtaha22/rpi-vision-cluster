@@ -78,12 +78,12 @@ if [[ $NATIVE -eq 1 ]]; then
     fi
     source "$RPI_CONFIG"
     _q_ws=$(printf '%q' "${RPI_WORKSPACE_DIR}")
-    NATIVE_WS=$(ssh "${MASTER_USER}@${MASTER_IP}" "bash -lc \"echo ${_q_ws}\"" 2>/dev/null) \
-        || { echo "[FATAL] Cannot SSH to ${MASTER_USER}@${MASTER_IP}"; exit 1; }
+    NATIVE_WS=$(ssh "${MASTER_USER}@${MASTER_HOST}" "bash -lc \"echo ${_q_ws}\"" 2>/dev/null) \
+        || { echo "[FATAL] Cannot SSH to ${MASTER_USER}@${MASTER_HOST}"; exit 1; }
     unset _q_ws
     CONT_WS="$NATIVE_WS"
     DS_ROOT="$NATIVE_WS/vision/datasets"
-    EXEC_PREFIX="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new ${MASTER_USER}@${MASTER_IP}"
+    EXEC_PREFIX="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new ${MASTER_USER}@${MASTER_HOST}"
 fi
 
 if [[ $NATIVE -eq 1 ]]; then
@@ -120,7 +120,7 @@ log "Nodes     : $RESILIENCE_NODES"
 log "Timeout   : ${TIMEOUT_SECS}s per test"
 log "Mode      : $([ $NATIVE -eq 1 ] && echo 'Native RPi (SSH)' || echo 'Docker containers (local)')"
 if [[ $NATIVE -eq 1 ]]; then
-    log "Hosts     : SSH ${MASTER_USER}@${MASTER_IP} (mpirun --host uses IPs)"
+    log "Hosts     : SSH ${MASTER_USER}@${MASTER_HOST} (mpirun --host uses .local names)"
 else
     log "Hosts     : Docker containers rpic_master/rpic_worker* (mpirun --host uses master/workerN)"
 fi
@@ -214,7 +214,7 @@ ensure_datasets() {
                 if [[ -d "$LOCAL_DS/$ds" ]]; then
                     rsync -az --info=progress2 \
                         "$LOCAL_DS/$ds/" \
-                        "${MASTER_USER}@${MASTER_IP}:${REMOTE_DS}/${ds}/" \
+                        "${MASTER_USER}@${MASTER_HOST}:${REMOTE_DS}/${ds}/" \
                         2>&1 | tee -a "$LOG_FILE"
                     log "  ✓ '$ds' pushed to Pi"
                 else
@@ -293,13 +293,53 @@ ensure_build_on_pi() {
     fi
 }
 
+# ── Alive-node tracking (native mode only) ────────────────────────────────────
+ALIVE_IPS=()
+
+probe_alive_nodes() {
+    local all_users=("$MASTER_USER"  "$WORKER1_USER" "$WORKER2_USER" "$WORKER3_USER" "$WORKER4_USER" "$WORKER5_USER")
+    local all_hosts=("$MASTER_HOST"  "$WORKER1_HOST" "$WORKER2_HOST" "$WORKER3_HOST" "$WORKER4_HOST" "$WORKER5_HOST")
+    ALIVE_IPS=()
+    for i in "${!all_hosts[@]}"; do
+        local u="${all_users[$i]}" h="${all_hosts[$i]}"
+        if ssh -o ConnectTimeout=5 -o BatchMode=yes "${u}@${h}" "hostname" &>/dev/null; then
+            ALIVE_IPS+=("$h")
+            log "  [UP]   ${u}@${h}"
+        else
+            log "  [DOWN] ${u}@${h} — excluded from MPI hostlists"
+        fi
+    done
+    if [[ ${#ALIVE_IPS[@]} -lt 2 ]]; then
+        die "Only ${#ALIVE_IPS[@]} node(s) reachable — need ≥ 2 for MPI. Check SSH keys (re-run rpi/setup_cluster.sh)."
+    fi
+    log "  Alive: ${#ALIVE_IPS[@]}/6 nodes — ${ALIVE_IPS[*]}"
+}
+
+pre_connect_workers() {
+    local all_hosts=("$WORKER1_HOST" "$WORKER2_HOST" "$WORKER3_HOST" "$WORKER4_HOST" "$WORKER5_HOST")
+    log "Pre-connecting SSH ControlMaster from master to alive workers..."
+    for h in "${all_hosts[@]}"; do
+        if [[ " ${ALIVE_IPS[*]} " == *" $h "* ]]; then
+            ssh -o BatchMode=yes "${MASTER_USER}@${MASTER_HOST}" \
+                "ssh -fN '$h'" \
+                2>/dev/null \
+                && log "  [MUX UP] master→${h}" \
+                || log "  [MUX SKIP] master→${h} — already connected (non-fatal)"
+        fi
+    done
+}
+
 # ── hostlist_for ──────────────────────────────────────────────────────────────
 hostlist_for() {
     local n="$1"
     if [[ $NATIVE -eq 1 ]]; then
-        local ALL_IPS=("$MASTER_IP" "$WORKER1_IP" "$WORKER2_IP" "$WORKER3_IP" "$WORKER4_IP" "$WORKER5_IP")
+        local avail="${#ALIVE_IPS[@]}"
+        if [[ $n -gt $avail ]]; then
+            log "  [WARN] Requested $n nodes but only $avail alive — clamping"
+            n="$avail"
+        fi
         local hosts=()
-        for ((i=0; i<n; i++)); do hosts+=("${ALL_IPS[$i]}"); done
+        for ((i=0; i<n; i++)); do hosts+=("${ALIVE_IPS[$i]}"); done
         local IFS=','; echo "${hosts[*]}"
     else
         local hosts=(master)
@@ -324,14 +364,22 @@ runc() {
 
     log "  [RUN] $bin  nodes=$nodes  args=$args"
 
+    local mpi_ssh_args=""
+    [[ $NATIVE -eq 1 ]] && mpi_ssh_args="--prtemca plm_rsh_args \"-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=10 -o ServerAliveCountMax=6\""
     local cmd="cd ${CONT_WS} && \
         mpirun --allow-run-as-root --oversubscribe -n ${nodes} --host ${hostlist} \
-        ${bin_path} ${args}"
+        ${mpi_ssh_args} ${bin_path} ${args}"
 
     if [[ "${TIMEOUT_SECS:-0}" -gt 0 ]]; then
-        timeout "$TIMEOUT_SECS" \
-            $EXEC_PREFIX bash -c "$cmd" \
-            2>&1 | tee -a "$LOG_FILE"
+        if [[ $NATIVE -eq 1 ]]; then
+            timeout "$TIMEOUT_SECS" \
+                ssh -o BatchMode=yes "${MASTER_USER}@${MASTER_HOST}" "$cmd" \
+                2>&1 | tee -a "$LOG_FILE"
+        else
+            timeout "$TIMEOUT_SECS" \
+                $EXEC_PREFIX bash -c "$cmd" \
+                2>&1 | tee -a "$LOG_FILE"
+        fi
         local ec=${PIPESTATUS[0]}
         if [[ $ec -eq 124 ]]; then
             log "  [TIMEOUT] $bin exceeded ${TIMEOUT_SECS}s — skipping"
@@ -339,9 +387,15 @@ runc() {
             log "  [WARN] $bin exited $ec (continuing)"
         fi
     else
-        $EXEC_PREFIX bash -c "$cmd" \
-            2>&1 | tee -a "$LOG_FILE" \
-        || log "  [WARN] $bin exited non-zero (continuing)"
+        if [[ $NATIVE -eq 1 ]]; then
+            ssh -o BatchMode=yes "${MASTER_USER}@${MASTER_HOST}" "$cmd" \
+                2>&1 | tee -a "$LOG_FILE" \
+            || log "  [WARN] $bin exited non-zero (continuing)"
+        else
+            $EXEC_PREFIX bash -c "$cmd" \
+                2>&1 | tee -a "$LOG_FILE" \
+            || log "  [WARN] $bin exited non-zero (continuing)"
+        fi
     fi
 }
 
@@ -369,6 +423,9 @@ if [[ $NATIVE -eq 0 ]]; then
         || log "[WARN] Cluster verification failed — continuing anyway"
 else
     section "STEP 1: Preparing RPi cluster (${RESILIENCE_NODES} nodes, SSH)"
+    log "Probing node liveness..."
+    probe_alive_nodes
+    pre_connect_workers
     ensure_build_on_pi
 fi
 
@@ -500,9 +557,15 @@ fi
 section "STEP 8: Copying resilience results to $OUT_DIR"
 mkdir -p "$OUT_DIR/resilience_images"
 if $EXEC_PREFIX test -d "$RES_CONT" 2>/dev/null; then
-    $EXEC_PREFIX bash -c \
-        "cd ${CONT_WS}/results && tar cf - resilience" \
-        | tar xf - -C "$WS/results/" 2>/dev/null || true
+    if [[ $NATIVE -eq 1 ]]; then
+        ssh -o BatchMode=yes "${MASTER_USER}@${MASTER_HOST}" \
+            "cd ${CONT_WS}/results && tar cf - resilience" \
+            | tar xf - -C "$WS/results/" 2>/dev/null || true
+    else
+        $EXEC_PREFIX bash -c \
+            "cd ${CONT_WS}/results && tar cf - resilience" \
+            | tar xf - -C "$WS/results/" 2>/dev/null || true
+    fi
     cp -r "$WS/results/resilience/." "$OUT_DIR/resilience_images/" 2>/dev/null || true
     log "  Resilience images → $OUT_DIR/resilience_images/"
 else
