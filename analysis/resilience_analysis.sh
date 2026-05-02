@@ -434,17 +434,29 @@ section "STEP 2: Dataset management + test image selection (--fix=$FIX)"
 RES_IMG=""
 
 if [[ -n "$CUSTOM_IMAGE" ]]; then
-    $EXEC_PREFIX test -s "$CUSTOM_IMAGE" 2>/dev/null \
-        || die "Custom image not found in container: $CUSTOM_IMAGE"
+    if [[ $NATIVE -eq 1 ]]; then
+        ssh -o BatchMode=yes "${MASTER_USER}@${MASTER_HOST}" \
+            "test -s '${CUSTOM_IMAGE}'" 2>/dev/null \
+            || die "Custom image not found on Pi: $CUSTOM_IMAGE"
+    else
+        $EXEC_PREFIX test -s "$CUSTOM_IMAGE" 2>/dev/null \
+            || die "Custom image not found in container: $CUSTOM_IMAGE"
+    fi
     RES_IMG="$CUSTOM_IMAGE"
     log "  Using custom image: $RES_IMG"
 else
     ensure_datasets "BSDS500" || die "Dataset provisioning failed"
 
     BSDS_DIR="$DS_ROOT/BSDS500/images"
-    RES_IMG=$($EXEC_PREFIX bash -c \
-        "find '${BSDS_DIR}' -type f -name '*.jpg' -size +0c 2>/dev/null | sort | head -1" \
-        2>/dev/null || true)
+    if [[ $NATIVE -eq 1 ]]; then
+        RES_IMG=$(ssh -o BatchMode=yes "${MASTER_USER}@${MASTER_HOST}" \
+            "find '${BSDS_DIR}' -type f -name '*.jpg' -size +0c 2>/dev/null | sort | head -1" \
+            2>/dev/null || true)
+    else
+        RES_IMG=$($EXEC_PREFIX bash -c \
+            "find '${BSDS_DIR}' -type f -name '*.jpg' -size +0c 2>/dev/null | sort | head -1" \
+            2>/dev/null || true)
+    fi
 
     if [[ -n "$RES_IMG" ]]; then
         log "  Using BSDS500 image: $RES_IMG"
@@ -556,7 +568,14 @@ fi
 # ── Step 8: Copy reconstructed resilience images ──────────────────────────────
 section "STEP 8: Copying resilience results to $OUT_DIR"
 mkdir -p "$OUT_DIR/resilience_images"
-if $EXEC_PREFIX test -d "$RES_CONT" 2>/dev/null; then
+RES_CONT_EXISTS=0
+if [[ $NATIVE -eq 1 ]]; then
+    ssh -o BatchMode=yes "${MASTER_USER}@${MASTER_HOST}" \
+        "test -d '${RES_CONT}'" 2>/dev/null && RES_CONT_EXISTS=1 || true
+else
+    $EXEC_PREFIX test -d "$RES_CONT" 2>/dev/null && RES_CONT_EXISTS=1 || true
+fi
+if [[ $RES_CONT_EXISTS -eq 1 ]]; then
     if [[ $NATIVE -eq 1 ]]; then
         ssh -o BatchMode=yes "${MASTER_USER}@${MASTER_HOST}" \
             "cd ${CONT_WS}/results && tar cf - resilience" \
