@@ -1562,7 +1562,21 @@ def main():
     parser.add_argument("--gt-dir",        default=os.path.join(SCRIPT_DIR, "../workspace/results/gt/groundTruth_png"))
     parser.add_argument("--node-counts",   default="2 4 6")
     parser.add_argument("--thread-counts", default="1 2 4")
+    parser.add_argument("--rpi",           action="store_true",
+                        help="Use RPi native paths (report_bsds_rpi/)")
     args = parser.parse_args()
+
+    if args.rpi:
+        _rpi = os.path.join(SCRIPT_DIR, "report_bsds_rpi")
+        if args.log == os.path.join(SCRIPT_DIR, "report_bsds/analysis_bsds.log"):
+            args.log = os.path.join(_rpi, "analysis_bsds_rpi.log")
+        if args.outdir == os.path.join(SCRIPT_DIR, "report_bsds"):
+            args.outdir = _rpi
+        if args.recon_dir == os.path.join(SCRIPT_DIR, "report_bsds/reconstructed"):
+            args.recon_dir = os.path.join(_rpi, "reconstructed")
+        if args.orig_dir == os.path.join(SCRIPT_DIR, "report_bsds/originals"):
+            args.orig_dir = os.path.join(_rpi, "originals")
+        # --gt-dir is workspace-relative, same for both modes
 
     node_counts   = [int(x) for x in args.node_counts.split()]
     thread_counts = [int(x) for x in args.thread_counts.split()]

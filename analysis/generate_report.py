@@ -909,7 +909,15 @@ def main():
     parser.add_argument("--workspace",     default="workspace")
     parser.add_argument("--node-counts",   default="2 4 6")
     parser.add_argument("--thread-counts", default="1 2 4")
+    parser.add_argument("--rpi",           action="store_true",
+                        help="Use RPi native paths (report_rpi/analysis_rpi_results.log)")
     args = parser.parse_args()
+
+    if args.rpi:
+        if args.log    == os.path.join(SCRIPT_DIR, "analysis_results.log"):
+            args.log    = os.path.join(SCRIPT_DIR, "report_rpi", "analysis_rpi_results.log")
+        if args.outdir == os.path.join(SCRIPT_DIR, "report"):
+            args.outdir = os.path.join(SCRIPT_DIR, "report_rpi")
 
     node_counts   = [int(x) for x in args.node_counts.split()]
     thread_counts = [int(x) for x in args.thread_counts.split()]

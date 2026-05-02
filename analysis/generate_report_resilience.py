@@ -486,7 +486,18 @@ def main():
     parser.add_argument("--outdir",         default=os.path.join(SCRIPT_DIR, "report_resilience"))
     parser.add_argument("--resilience-dir", default=os.path.join(SCRIPT_DIR, "report_resilience/resilience_images"))
     parser.add_argument("--nodes",          type=int, default=6)
+    parser.add_argument("--rpi",            action="store_true",
+                        help="Use RPi native paths (report_resilience_rpi/)")
     args = parser.parse_args()
+
+    if args.rpi:
+        _rpi = os.path.join(SCRIPT_DIR, "report_resilience_rpi")
+        if args.log == os.path.join(SCRIPT_DIR, "report_resilience/analysis_resilience.log"):
+            args.log = os.path.join(_rpi, "analysis_resilience_rpi.log")
+        if args.outdir == os.path.join(SCRIPT_DIR, "report_resilience"):
+            args.outdir = _rpi
+        if args.resilience_dir == os.path.join(SCRIPT_DIR, "report_resilience/resilience_images"):
+            args.resilience_dir = os.path.join(_rpi, "resilience_images")
 
     if not os.path.exists(args.log):
         print(f"[ERROR] Log not found: {args.log}")
