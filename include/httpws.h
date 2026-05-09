@@ -599,21 +599,25 @@ private:
     }
 
     void handle_client(int fd) {
-        // Read HTTP request
-        char buf[4096] = {0};
-        ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
-        if (n <= 0) { close(fd); return; }
-        buf[n] = '\0';
+        std::string request;
+        char tmp[1];
+        // Read byte by byte until we see \r\n\r\n (end of HTTP headers)
+        while (request.size() < 8192) {
+            ssize_t r = recv(fd, tmp, 1, 0);
+            if (r <= 0) { close(fd); return; }
+            request += tmp[0];
+            if (request.size() >= 4 &&
+                request.substr(request.size() - 4) == "\r\n\r\n") break;
+        }
 
-        std::string req(buf);
-        bool is_ws_upgrade = (req.find("Upgrade: websocket") != std::string::npos ||
-                               req.find("Upgrade: WebSocket") != std::string::npos);
-        bool is_ws_path    = (req.find("GET /ws") != std::string::npos);
+        bool is_ws_upgrade = request.find("Upgrade: websocket") != std::string::npos ||
+                            request.find("Upgrade: WebSocket") != std::string::npos;
+        bool is_ws_path    = request.find("GET /ws") != std::string::npos;
 
         if (is_ws_upgrade && is_ws_path) {
-            handle_ws_upgrade(fd, req);
+            handle_ws_upgrade(fd, request);
         } else {
-            serve_http(fd, req);
+            serve_http(fd, request);
         }
     }
 
