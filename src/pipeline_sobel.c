@@ -57,7 +57,7 @@
 
 /* ─── Constants ─────────────────────────────────────────────── */
 
-#define CONFIG_PATH       "./pipeline.conf"
+#define CONFIG_PATH       "./src/pipeline.conf"
 #define TCP_PORT          9000
 #define TCP_BACKLOG       4
 #define MAX_SEND_TO       3
