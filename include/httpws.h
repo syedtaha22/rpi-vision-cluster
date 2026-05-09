@@ -478,19 +478,19 @@ static const char* HTML_PAGE = R"html(<!DOCTYPE html>
     if (!streaming || !ws || ws.readyState !== WebSocket.OPEN) return;
 
     srcCtx.drawImage(video, 0, 0, W, H);
+    // Note: getImageData returns a Uint8ClampedArray which may have a larger buffer than W*H*4.
     const pixels = srcCtx.getImageData(0, 0, W, H);
-
-    // Build message: [frame_id: 4 bytes big-endian][RGBA: W*H*4 bytes]
     const id = frameId++ & 0xFFFFFFFF;
-    const msg = new Uint8Array(4 + pixels.data.byteLength);
-    msg[0] = (id >> 24) & 0xFF;
-    msg[1] = (id >> 16) & 0xFF;
-    msg[2] = (id >>  8) & 0xFF;
-    msg[3] =  id        & 0xFF;
-    msg.set(new Uint8Array(pixels.data.buffer), 4);
-
+    // Allocate exact size, don't trust pixels.data.buffer length
+    const raw = new Uint8Array(4 + W * H * 4);
+    raw[0] = (id >> 24) & 0xFF;
+    raw[1] = (id >> 16) & 0xFF;
+    raw[2] = (id >>  8) & 0xFF;
+    raw[3] =  id        & 0xFF;
+    // pixels.data is Uint8ClampedArray — copy exactly W*H*4 bytes
+    for (let i = 0; i < W * H * 4; i++) raw[4 + i] = pixels.data[i];
     sendTimes[id] = performance.now();
-    ws.send(msg.buffer);
+    ws.send(raw.buffer);
 
     // ~30 fps
     setTimeout(() => requestAnimationFrame(sendFrame), 33);
