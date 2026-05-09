@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
     }
 
     Logger logger("logs/server.log");
-    SobelProcessor processor(kFrameWidth, kFrameHeight);
+    SobelProcessor processor(kFrameWidth, kFrameHeight, "192.168.1.250", 9000);
     HttpServer server(port, logger, processor);
     server.run();
     return 0;
