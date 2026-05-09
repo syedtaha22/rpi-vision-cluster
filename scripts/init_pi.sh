@@ -22,8 +22,8 @@ set -euo pipefail
 # Configuration
 # =============================================================================
 
-SHARED_FOLDER="/rpi-vision"
-PACKAGES_BUILD=(build-essential git make gcc g++ cmake)
+SHARED_FOLDER="/rpi-vision-cluster"
+PACKAGES_BUILD=(build-essential git make gcc g++ cmake glances)
 PACKAGES_MPI=(libopenmpi-dev openmpi-bin libomp-dev)
 PACKAGES_NFS_SERVER=(nfs-kernel-server nfs-common)
 PACKAGES_NFS_CLIENT=(nfs-common)
@@ -60,9 +60,57 @@ install_packages() {
             log_ok "$pkg already installed"
         else
             log_info "Installing $pkg..."
-            apt-get install -y "$pkg" >/dev/null 2>&1
+            apt-get install -y "$pkg"
         fi
     done
+}
+
+# Configure a permanent static IPv4 address on eth0 via netplan
+set_static_eth0_ip() {
+        local static_ip="$1"
+        local netplan_dir="/etc/netplan"
+        local netplan_file=""
+        local backup_file=""
+
+        log_info "Configuring permanent eth0 address: ${static_ip}/24"
+
+        if [ ! -d "$netplan_dir" ]; then
+                mkdir -p "$netplan_dir"
+        fi
+
+        netplan_file="$(find "$netplan_dir" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) -exec grep -l 'eth0' {} + 2>/dev/null | head -n1 || true)"
+        if [ -z "$netplan_file" ]; then
+                netplan_file="$netplan_dir/99-eth0-static.yaml"
+        else
+                backup_file="${netplan_file}.bak.$(date +%Y%m%d%H%M%S)"
+                cp "$netplan_file" "$backup_file"
+                log_ok "Backed up existing netplan config to $backup_file"
+        fi
+
+        cat > "$netplan_file" <<EOF
+network:
+    version: 2
+    ethernets:
+        eth0:
+            renderer: NetworkManager
+            match: {}
+            dhcp4: false
+            dhcp6: false
+            addresses:
+                - ${static_ip}/24
+            networkmanager:
+                uuid: "75a1216a-9d1a-30cd-8aca-ace5526ec021"
+                name: "netplan-eth0"
+                passthrough:
+                    proxy._: ""
+EOF
+
+            chown root:root "$netplan_file"
+            chmod 600 "$netplan_file"
+
+        log_info "Applying netplan configuration"
+        netplan apply
+        log_ok "Permanent eth0 address configured: ${static_ip}/24"
 }
 
 # =============================================================================
@@ -158,6 +206,30 @@ setup_worker() {
 }
 
 # =============================================================================
+# Optimization: Disable Wi-Fi Power Management
+# =============================================================================
+
+disable_wifi_power_management() {
+    log_info "Optimizing Wi-Fi for MPI (disabling power management)..."
+    
+    # 1. Apply immediately if wlan0 exists
+    if ip link show wlan0 >/dev/null 2>&1; then
+        iwconfig wlan0 power off || log_warn "Could not set power off immediately"
+        
+        # 2. Make it persistent across reboots via an udev rule
+        local rule_file="/etc/udev/rules.d/81-wifi-pm.rules"
+        if [ ! -f "$rule_file" ]; then
+            echo 'ACTION=="add", SUBSYSTEM=="net", KERNEL=="wlan0", RUN+="/sbin/iwconfig wlan0 power off"' > "$rule_file"
+            log_ok "Created udev rule for persistent Wi-Fi power management"
+        else
+            log_ok "Persistent Wi-Fi rule already exists"
+        fi
+    else
+        log_warn "wlan0 not found, skipping Wi-Fi optimization"
+    fi
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -167,19 +239,25 @@ main() {
     check_root
 
     local hostname
+    local static_ip
     hostname="$(hostname)"
     
     log_info "Hostname: $hostname"
 
     if [ "$hostname" = "rpi-master" ]; then
+        static_ip="192.168.1.250"
         setup_master
     elif [[ "$hostname" =~ ^rpi-worker[0-9]+$ ]]; then
+        static_ip="192.168.1.${hostname#rpi-worker}"
         setup_worker "$hostname"
     else
         log_error "Unknown hostname: $hostname"
         log_error "Expected 'rpi-master' or 'rpi-worker*' format"
         exit 1
     fi
+
+    disable_wifi_power_management
+    set_static_eth0_ip "$static_ip"
 
     echo ""
     log_ok "Initialization complete!"
