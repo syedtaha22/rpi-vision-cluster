@@ -169,11 +169,13 @@ void result_dispatch_thread(HttpWsServer* server) {
 void on_frame_received(uint32_t frame_id,
                        const std::vector<uint8_t>& rgba,
                        int width, int height) {
-    fprintf(stderr, "[ingestion] frame_id=%u arrived from browser (%dx%d)\n",
-            frame_id, width, height);
-
     {
         std::lock_guard<std::mutex> lk(g_frame_mutex);
+        // Drop frame if queue is backed up — keep at most 2 frames queued
+        if (g_frame_queue.size() >= 2) {
+            fprintf(stderr, "[ingestion] dropping frame_id=%u (queue full)\n", frame_id);
+            return;
+        }
         g_frame_queue.push({frame_id, rgba, width, height});
     }
     g_frame_cv.notify_one();
