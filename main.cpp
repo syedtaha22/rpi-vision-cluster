@@ -19,6 +19,7 @@
   * @return exit code
   */
 int main(int argc, char** argv) {
+    printf("Main::main: Starting server...\n");
     constexpr int kDefaultPort = 8080;
     constexpr int kFrameWidth = 640;
     constexpr int kFrameHeight = 480;
