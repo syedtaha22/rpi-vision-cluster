@@ -87,7 +87,10 @@ static inline std::vector<uint8_t> ws_read_frame(int fd) {
         size_t got = 0;
         while (got < n) {
             ssize_t r = recv(fd, buf + got, n - got, 0);
-            if (r <= 0) return false;
+            if (r <= 0) {
+              fprintf(stderr, "[ws_read] recv returned %zd after %zu/%zu bytes\n", r, got, n);
+              return false;
+            } 
             got += r;
         }
         return true;
@@ -122,6 +125,8 @@ static inline std::vector<uint8_t> ws_read_frame(int fd) {
         for (size_t i = 0; i < payload_len; ++i)
             payload[i] ^= mask[i % 4];
     }
+    fprintf(stderr, "[ws_read] opcode=%d masked=%d payload_len=%llu\n",
+        opcode, (int)masked, (unsigned long long)payload_len);
 
     return payload;
 }
