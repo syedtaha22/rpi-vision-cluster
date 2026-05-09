@@ -88,47 +88,55 @@ static inline std::vector<uint8_t> ws_read_frame(int fd) {
         while (got < n) {
             ssize_t r = recv(fd, buf + got, n - got, 0);
             if (r <= 0) {
-              fprintf(stderr, "[ws_read] recv returned %zd after %zu/%zu bytes\n", r, got, n);
-              return false;
-            } 
+                fprintf(stderr, "[ws_read] recv returned %zd after %zu/%zu bytes\n", r, got, n);
+                return false;
+            }
             got += r;
         }
         return true;
     };
 
-    uint8_t hdr[2];
-    if (!readall(hdr, 2)) return {};
+    std::vector<uint8_t> assembled;
 
-    // bool fin    = (hdr[0] & 0x80) != 0;  // unused for now
-    int  opcode = (hdr[0] & 0x0F);
-    bool masked = (hdr[1] & 0x80) != 0;
-    uint64_t payload_len = (hdr[1] & 0x7F);
+    while (true) {
+        uint8_t hdr[2];
+        if (!readall(hdr, 2)) return {};
 
-    if (opcode == 0x8) return {};  // close frame
+        bool     fin        = (hdr[0] & 0x80) != 0;
+        int      opcode     = (hdr[0] & 0x0F);
+        bool     masked     = (hdr[1] & 0x80) != 0;
+        uint64_t payload_len = (hdr[1] & 0x7F);
 
-    if (payload_len == 126) {
-        uint8_t ext[2]; if (!readall(ext, 2)) return {};
-        payload_len = ((uint64_t)ext[0] << 8) | ext[1];
-    } else if (payload_len == 127) {
-        uint8_t ext[8]; if (!readall(ext, 8)) return {};
-        payload_len = 0;
-        for (int i = 0; i < 8; ++i) payload_len = (payload_len << 8) | ext[i];
+        if (opcode == 0x8) return {};  // close frame
+
+        if (payload_len == 126) {
+            uint8_t ext[2]; if (!readall(ext, 2)) return {};
+            payload_len = ((uint64_t)ext[0] << 8) | ext[1];
+        } else if (payload_len == 127) {
+            uint8_t ext[8]; if (!readall(ext, 8)) return {};
+            payload_len = 0;
+            for (int i = 0; i < 8; ++i) payload_len = (payload_len << 8) | ext[i];
+        }
+
+        uint8_t mask[4] = {0};
+        if (masked) { if (!readall(mask, 4)) return {}; }
+
+        size_t offset = assembled.size();
+        assembled.resize(offset + payload_len);
+        if (!readall(assembled.data() + offset, payload_len)) return {};
+
+        if (masked) {
+            for (size_t i = 0; i < payload_len; ++i)
+                assembled[offset + i] ^= mask[i % 4];
+        }
+
+        fprintf(stderr, "[ws_read] opcode=%d fin=%d masked=%d payload_len=%llu total=%zu\n",
+                opcode, (int)fin, (int)masked,
+                (unsigned long long)payload_len, assembled.size());
+
+        if (fin) return assembled;  // last fragment, return complete message
+        // else continue loop to read next fragment
     }
-
-    uint8_t mask[4] = {0};
-    if (masked) { if (!readall(mask, 4)) return {}; }
-
-    std::vector<uint8_t> payload(payload_len);
-    if (!readall(payload.data(), payload_len)) return {};
-
-    if (masked) {
-        for (size_t i = 0; i < payload_len; ++i)
-            payload[i] ^= mask[i % 4];
-    }
-    fprintf(stderr, "[ws_read] opcode=%d masked=%d payload_len=%llu\n",
-        opcode, (int)masked, (unsigned long long)payload_len);
-
-    return payload;
 }
 
 // ── Embedded HTML page (served at GET /) ─────────────────────────────────────
